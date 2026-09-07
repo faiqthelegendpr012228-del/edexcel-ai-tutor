@@ -140,6 +140,21 @@ const schema = defineSchema(
       updatedAt: v.number(),
     }).index("by_user_updated", ["userId", "updatedAt"]),
 
+    // Spaced-repetition flashcards generated from tutoring answers.
+    // Leitner boxes: 0 = new/struggling ... 5 = mastered.
+    flashcards: defineTable({
+      userId: v.id("users"),
+      chatId: v.optional(v.id("chats")),
+      subject: v.optional(v.string()),
+      front: v.string(),
+      back: v.string(),
+      box: v.number(),
+      mastered: v.boolean(),
+      nextDueAt: v.number(),
+      lastReviewedAt: v.optional(v.number()),
+      createdAt: v.number(),
+    }).index("by_user_due", ["userId", "nextDueAt"]),
+
     // Chat messages. Assistant messages carry structured citations so the UI
     // can render clickable [Source: ...] chips backed by the actual passage.
     messages: defineTable({
