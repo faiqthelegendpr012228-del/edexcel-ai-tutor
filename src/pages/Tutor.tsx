@@ -332,9 +332,36 @@ function AssistantBubble({
   onAllowOutside: () => void;
   allowingOutside: boolean;
 }) {
+  const navigate = useNavigate();
+  const generateCards = useAction(api.practice.generateFromMessage);
+  const [generatingCards, setGeneratingCards] = useState(false);
+
   const thinking =
     (message.status === "thinking" || message.status === "streaming") &&
     message.content.trim().length === 0;
+
+  const handleGenerateCards = async () => {
+    if (generatingCards) return;
+    setGeneratingCards(true);
+    try {
+      const count = await generateCards({ messageId: message._id });
+      toast.success(
+        `${count} flashcard${count === 1 ? "" : "s"} created.`,
+        {
+          action: {
+            label: "Review",
+            onClick: () => navigate("/flashcards"),
+          },
+        },
+      );
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : "Couldn't create flashcards.",
+      );
+    } finally {
+      setGeneratingCards(false);
+    }
+  };
 
   return (
     <div className="flex gap-3">
@@ -360,6 +387,22 @@ function AssistantBubble({
               {message.status === "complete" && (
                 <CitationList citations={message.citations ?? []} />
               )}
+              {message.status === "complete" &&
+                message.content.trim().length > 0 &&
+                !message.needsPermission && (
+                  <div className="mt-3 flex flex-wrap items-center gap-1.5">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 gap-1.5 rounded-full px-2.5 text-xs text-muted-foreground"
+                      disabled={generatingCards}
+                      onClick={() => void handleGenerateCards()}
+                    >
+                      <Layers className="size-3.5" />
+                      {generatingCards ? "Creating flashcards…" : "Make flashcards"}
+                    </Button>
+                  </div>
+                )}
               {message.needsPermission && (
                 <div className="mt-3 rounded-xl border border-amber-500/40 bg-amber-500/10 p-3">
                   <p className="text-sm font-medium text-foreground">

@@ -1,12 +1,6 @@
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { v, type GenericId } from "convex/values";
-import {
-  action,
-  internalMutation,
-  internalQuery,
-  mutation,
-  query,
-} from "./_generated/server";
+import { action, mutation, query } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { chatCompletion, MODELS } from "./lib/ai";
 
@@ -15,7 +9,6 @@ type Id<T extends string> = GenericId<T>;
 // Leitner-style spaced repetition. Box 0 = new/struggling, box 5 = mastered.
 // Index 0 is the "again" re-queue delay; 1..5 are the got-it intervals.
 const BOX_INTERVAL_MINUTES = [2, 1440, 4320, 10080, 20160, 43200];
-const MAX_CARDS_PER_USER = 500;
 
 const FLASHCARD_SYSTEM_PROMPT = `You create study flashcards from tutoring material for Edexcel students. Reply with ONLY a JSON array of 4-8 objects, each {"front": string, "back": string}. Front: a precise question or recall prompt covering one fact, definition, formula or concept from the material. Back: a concise, correct answer in 1-3 sentences. Cover the most exam-relevant points. No prose, no markdown fences, no numbering.`;
 
@@ -140,11 +133,11 @@ function isCard(value: unknown): value is { front: string; back: string } {
 
 export const generateFromMessage = action({
   args: { messageId: v.id("messages") },
-  handler: async (ctx, args) => {
+  handler: async (ctx, args): Promise<number> => {
     const userId = await getAuthUserId(ctx);
     if (userId === null) throw new Error("Not authenticated");
 
-    const message = await ctx.runQuery(internal.practice._getMessage, {
+    const message = await ctx.runQuery(internal.practiceInternal._getMessage, {
       messageId: args.messageId,
     });
     if (!message || message.userId !== userId) {
@@ -159,7 +152,7 @@ export const generateFromMessage = action({
     }
 
     const chat = message.chatId
-      ? await ctx.runQuery(internal.practice._getChat, {
+      ? await ctx.runQuery(internal.practiceInternal._getChat, {
           chatId: message.chatId,
         })
       : null;
@@ -206,58 +199,11 @@ export const generateFromMessage = action({
       );
     }
 
-    return await ctx.runMutation(internal.practice._insertCards, {
+    return await ctx.runMutation(internal.practiceInternal._insertCards, {
       userId,
       chatId: message.chatId,
       subject: chat?.subject ?? undefined,
       cards,
     });
-  },
-});
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-export const _getMessage = internalQuery({
-  args: { messageId: v.id("messages") },
-  handler: async (ctx, args) => await ctx.db.get(args.messageId),
-});
-
-export const _getChat = internalQuery({
-  args: { chatId: v.id("chats") },
-  handler: async (ctx, args) => await ctx.db.get(args.chatId),
-});
-
-export const _insertCards = internalMutation({
-  args: {
-    userId: v.id("users"),
-    chatId: v.optional(v.id("chats")),
-    subject: v.optional(v.string()),
-    cards: v.array(v.object({ front: v.string(), back: v.string() })),
-  },
-  handler: async (ctx, args) => {
-    const existing = await ctx.db
-      .query("flashcards")
-      .withIndex("by_user_due", (q) => q.eq("userId", args.userId))
-      .collect();
-    let count = 0;
-    for (const card of args.cards) {
-      if (existing.length + count >= MAX_CARDS_PER_USER) break;
-      const now = Date.now();
-      await ctx.db.insert("flashcards", {
-        userId: args.userId,
-        chatId: args.chatId,
-        subject: args.subject,
-        front: card.front,
-        back: card.back,
-        box: 0,
-        mastered: false,
-        nextDueAt: now,
-        createdAt: now,
-      });
-      count++;
-    }
-    return count;
   },
 });

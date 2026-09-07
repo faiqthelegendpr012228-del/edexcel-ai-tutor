@@ -22,6 +22,7 @@ import {
   MessagesSquare,
   Plus,
   Target,
+  Zap,
 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router";
@@ -245,6 +246,7 @@ function DashboardContent() {
   const profile = useQuery(api.profiles.getMyProfile);
   const chats = useQuery(api.chats.listChats);
   const sources = useQuery(api.sources.listSources);
+  const flashStats = useQuery(api.practice.getStats);
 
   const readySources = useMemo(
     () => (sources ?? []).filter((s) => s.status === "ready"),
@@ -340,6 +342,33 @@ function DashboardContent() {
           }
         />
       </div>
+
+      {/* Spaced repetition nudge */}
+      {(flashStats?.due ?? 0) > 0 && (
+        <div className="flex flex-col gap-3 rounded-2xl border border-amber-500/40 bg-amber-500/10 p-4 sm:flex-row sm:items-center">
+          <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-amber-500/20 text-amber-600 dark:text-amber-400">
+            <Zap className="size-4.5" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-medium">
+              {flashStats?.due} flashcard{(flashStats?.due ?? 0) === 1 ? " is" : "s are"} due for
+              review
+            </p>
+            <p className="text-xs text-muted-foreground">
+              Spaced repetition works best on schedule — a few minutes now
+              locks the ideas in.
+            </p>
+          </div>
+          <Button
+            size="sm"
+            className="shrink-0 gap-2"
+            onClick={() => navigate("/flashcards")}
+          >
+            Review now
+            <ArrowRight className="size-4" />
+          </Button>
+        </div>
+      )}
 
       {/* Primary CTA */}
       <div className="relative overflow-hidden rounded-2xl border bg-gradient-to-br from-primary to-indigo-900 p-6 text-primary-foreground shadow-lg sm:p-8">

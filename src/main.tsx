@@ -15,6 +15,7 @@ const AuthPage = lazy(() => import("./pages/Auth.tsx"));
 const Dashboard = lazy(() => import("./pages/Dashboard.tsx"));
 const Tutor = lazy(() => import("./pages/Tutor.tsx"));
 const Sources = lazy(() => import("./pages/Sources.tsx"));
+const Flashcards = lazy(() => import("./pages/Flashcards.tsx"));
 const NotFound = lazy(() => import("./pages/NotFound.tsx"));
 
 // Simple loading fallback for route transitions
@@ -155,6 +156,14 @@ createRoot(document.getElementById("root")!).render(
                 element={
                   <RequireAuth>
                     <Sources />
+                  </RequireAuth>
+                }
+              />
+              <Route
+                path="/flashcards"
+                element={
+                  <RequireAuth>
+                    <Flashcards />
                   </RequireAuth>
                 }
               />
