@@ -27,7 +27,7 @@ import type { Doc, Id } from "@/convex/_generated/dataModel";
 import { useAuth } from "@/hooks/use-auth";
 import { cn } from "@/lib/utils";
 import { QUALIFICATIONS } from "@/lib/curriculum";
-import { useMutation, useQuery } from "convex/react";
+import { useAction, useMutation, useQuery } from "convex/react";
 import { formatDistanceToNow } from "date-fns";
 import {
   ArrowLeft,
@@ -402,7 +402,7 @@ function ChatView({ chatId }: { chatId: Id<"chats"> }) {
   const allSources = useQuery(api.sources.listSources);
   const chats = useQuery(api.chats.listChats);
 
-  const sendAction = useMutation(api.chats.askTutor);
+  const sendAction = useAction(api.chats.askTutor);
   const updateChat = useMutation(api.chats.updateChat);
   const deleteChat = useMutation(api.chats.deleteChat);
 

@@ -19,7 +19,7 @@ import {
 } from "@/components/ui/select";
 import { api } from "@/convex/_generated/api";
 import type { Doc, Id } from "@/convex/_generated/dataModel";
-import { useMutation, useQuery } from "convex/react";
+import { useAction, useMutation, useQuery } from "convex/react";
 import {
   AlertTriangle,
   FileText,
@@ -206,7 +206,7 @@ export default function Sources() {
 
   const generateUploadUrl = useMutation(api.sources.generateUploadUrl);
   const createSource = useMutation(api.sources.createSource);
-  const deleteSource = useMutation(api.sources.deleteSource);
+  const deleteSource = useAction(api.sources.deleteSource);
   const createCollection = useMutation(api.sources.createCollection);
   const deleteCollection = useMutation(api.sources.deleteCollection);
 
