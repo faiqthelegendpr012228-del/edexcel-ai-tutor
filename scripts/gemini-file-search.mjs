@@ -135,7 +135,9 @@ async function upload(fileArg, displayNameArg) {
   const metadata = [
     { key: "owner", stringValue: "shared" },
     { key: "uploaded_via", stringValue: "setup-script" },
-    ...(subjectTag ? [{ key: "subject", stringValue: subjectTag }] : []),
+    // No --subject flag → tagged "All" so the document surfaces in every
+    // subject's tutor. Subject-scoped shared docs only match their tag.
+    { key: "subject", stringValue: subjectTag ?? "All" },
   ];
 
   console.log(

@@ -2,8 +2,29 @@ import { getAuthUserId } from "@convex-dev/auth/server";
 import { v, type GenericId } from "convex/values";
 import { action, mutation, query } from "./_generated/server";
 import { internal } from "./_generated/api";
+import { QUALIFICATIONS } from "../lib/curriculum";
 
 type Id<T extends string> = GenericId<T>;
+
+// Every subject name the curriculum defines, across all qualifications.
+// Personal uploads must carry one of these tags — enforced here on the
+// backend, not just in the UI, so no path can save an untagged file.
+const KNOWN_SUBJECTS = new Set(
+  QUALIFICATIONS.flatMap((q) => q.subjects.map((s) => s.name)),
+);
+
+function validateSubject(subject: string): string {
+  const trimmed = subject.trim();
+  if (!trimmed) {
+    throw new Error("A subject tag is required for uploads.");
+  }
+  if (!KNOWN_SUBJECTS.has(trimmed)) {
+    throw new Error(
+      `Unknown subject "${trimmed}" — pick one from your qualification's subject list.`,
+    );
+  }
+  return trimmed;
+}
 
 // ---------------------------------------------------------------------------
 // Upload + source lifecycle
@@ -30,13 +51,17 @@ export const createSource = mutation({
       v.literal("unknown"),
     ),
     size: v.number(),
-    subject: v.optional(v.string()),
+    // Required and validated server-side: personal uploads always carry
+    // exactly one subject tag, which drives per-subject retrieval scoping.
+    subject: v.string(),
     qualification: v.optional(v.string()),
     collectionId: v.optional(v.id("collections")),
   },
   handler: async (ctx, args) => {
     const userId = await getAuthUserId(ctx);
     if (userId === null) throw new Error("Not authenticated");
+
+    const subject = validateSubject(args.subject);
 
     if (args.collectionId) {
       const collection = await ctx.db.get(args.collectionId);
@@ -51,7 +76,7 @@ export const createSource = mutation({
       storageId: args.storageId,
       name: args.name,
       type: args.type,
-      subject: args.subject,
+      subject,
       qualification: args.qualification,
       collectionId: args.collectionId,
       size: args.size,
@@ -103,6 +128,14 @@ export const retrySource = mutation({
       userId,
       storageId: source.storageId,
       type: source.type,
+    });
+
+    // Retry the Gemini mirror too — the action no-ops when the key is
+    // missing or the document is already indexed.
+    await ctx.scheduler.runAfter(0, internal.processSource.uploadToGemini, {
+      sourceId: args.sourceId,
+      userId,
+      storageId: source.storageId,
     });
   },
 });
@@ -171,6 +204,8 @@ export const updateSourceMeta = mutation({
   args: {
     sourceId: v.id("sources"),
     name: v.optional(v.string()),
+    // Subject can be re-tagged but never cleared or set to an unknown value,
+    // so scoping metadata stays consistent for every source.
     subject: v.optional(v.string()),
     qualification: v.optional(v.string()),
     collectionId: v.optional(v.union(v.id("collections"), v.null())),
@@ -180,6 +215,10 @@ export const updateSourceMeta = mutation({
     if (userId === null) throw new Error("Not authenticated");
     const source = await ctx.db.get(args.sourceId);
     if (!source || source.userId !== userId) throw new Error("Not found");
+
+    if (args.subject !== undefined) {
+      validateSubject(args.subject);
+    }
 
     if (args.collectionId !== undefined && args.collectionId !== null) {
       const collection = await ctx.db.get(args.collectionId);

@@ -450,11 +450,15 @@ export const askTutor = action({
         try {
           const storeName = await resolveGeminiStoreName();
           // Scope retrieval to the active subject and this student's own
-          // uploads, plus any shared board documents. Subject tag is applied
-          // at upload time from the same curriculum list used across the app.
+          // uploads, plus shared board documents. Personal documents must
+          // match the subject exactly — an untagged personal file would match
+          // nothing, never everything. Shared docs are board-wide: unscoped
+          // ones are tagged subject="All" by the setup script and surface in
+          // every subject; subject-scoped shared docs only match their tag.
           const subjectTag = chat.subject;
+          const esc = subjectTag?.replace(/"/g, '\\"') ?? "";
           const filter = subjectTag
-            ? `subject = "${subjectTag.replace(/"/g, "\\\"")}" AND (owner = "${userId}" OR owner = "shared")`
+            ? `(owner = "${userId}" AND subject = "${esc}") OR (owner = "shared" AND (subject = "All" OR subject = "${esc}"))`
             : `owner = "${userId}" OR owner = "shared"`;
           const contents: Array<{ role: "user" | "model"; text: string }> = [];
           for (const m of past.slice(-10)) {
