@@ -65,6 +65,60 @@ function temperatureFor(model: string, requested?: number): number | undefined {
   return requested ?? 0.7;
 }
 
+/**
+ * Direct OpenAI chat completion. Used as a reliability fallback when the VLY
+ * gateway rejects the request (e.g. gateway-side key/auth hiccups) so the
+ * product keeps working with the student's own OPENAI_API_KEY.
+ *
+ * Reasoning-style models need `max_completion_tokens` and no custom
+ * temperature; standard models take `max_tokens` + `temperature`.
+ */
+async function directOpenAIChat(
+  messages: ChatMessage[],
+  model: string,
+  temperature: number | undefined,
+  maxTokens: number | undefined,
+): Promise<ChatResult> {
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) {
+    throw new Error("No OPENAI_API_KEY configured for direct fallback");
+  }
+  const body: Record<string, unknown> = { model, messages };
+  if (isReasoningModel(model)) {
+    if (maxTokens !== undefined) body.max_completion_tokens = maxTokens;
+  } else {
+    if (temperature !== undefined) body.temperature = temperature;
+    if (maxTokens !== undefined) body.max_tokens = maxTokens;
+  }
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${key}`,
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(
+      `OpenAI request failed (${res.status}): ${text.slice(0, 300)}`,
+    );
+  }
+  const data = (await res.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+    usage?: { prompt_tokens?: number; completion_tokens?: number };
+  };
+  const content = data.choices?.[0]?.message?.content ?? "";
+  if (!content.trim()) {
+    throw new Error("The model returned an empty response.");
+  }
+  return {
+    content,
+    promptTokens: data.usage?.prompt_tokens ?? 0,
+    completionTokens: data.usage?.completion_tokens ?? 0,
+  };
+}
+
 export async function streamChatCompletion(
   messages: ChatMessage[],
   onDelta: (delta: string) => void,
@@ -145,6 +199,30 @@ export async function streamChatCompletion(
     }
   }
 
+  // 3) Direct-OpenAI fallback: the gateway is rejecting the key but the
+  //    student's own OPENAI_API_KEY still works. Simulate streaming so the
+  //    UI behaves exactly as before.
+  if (process.env.OPENAI_API_KEY) {
+    for (const attemptModel of attempts) {
+      try {
+        const res = await directOpenAIChat(
+          messages,
+          attemptModel,
+          temperatureFor(attemptModel, opts?.temperature),
+          opts?.maxTokens,
+        );
+        for (const piece of res.content.match(/[\s\S]{1,120}/g) ?? [
+          res.content,
+        ]) {
+          onDelta(piece);
+        }
+        return res;
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : String(err);
+      }
+    }
+  }
+
   throw new Error(lastError);
 }
 
@@ -180,6 +258,25 @@ export async function chatCompletion(
       lastError = err instanceof Error ? err.message : String(err);
     }
   }
+
+  // Direct-OpenAI fallback when the gateway rejects the key entirely.
+  if (process.env.OPENAI_API_KEY) {
+    const attempts: string[] = [model];
+    if (MODELS.fallback !== model) attempts.push(MODELS.fallback);
+    for (const attemptModel of attempts) {
+      try {
+        return await directOpenAIChat(
+          messages,
+          attemptModel,
+          temperatureFor(attemptModel, opts?.temperature ?? 0.5),
+          opts?.maxTokens ?? 200,
+        );
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : String(err);
+      }
+    }
+  }
+
   throw new Error(lastError);
 }
 

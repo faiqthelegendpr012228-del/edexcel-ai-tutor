@@ -14,8 +14,12 @@ import {
 // `internal.processSource.*` without circular type inference.
 
 // Sanity caps so a single upload can't blow through action timeouts/costs.
-const MAX_PAGES_PROCESSED = 300;
-const MAX_CHUNKS = 400;
+// 600 pages covers full textbooks; chunking keeps ~1500 chars per passage.
+const MAX_PAGES_PROCESSED = 600;
+const MAX_CHUNKS = 2000;
+// Chunks are written in small batches so large books stay well under the
+// per-transaction document-size limit.
+const CHUNK_WRITE_BATCH = 50;
 
 export const processSource = internalAction({
   args: {
@@ -56,13 +60,21 @@ export const processSource = internalAction({
         return;
       }
 
+      // Surface the page count immediately so the card shows progress while
+      // embeddings are still being generated.
+      await ctx.runMutation(internal.processSource.markSourceProgress, {
+        sourceId: args.sourceId,
+        userId: args.userId,
+        pageCount: pages.length,
+      });
+
       const chunks = chunkDocument({ ...extracted, pages }).slice(0, MAX_CHUNKS);
 
       // Semantic retrieval when the deployment has an OpenAI key; otherwise
       // the chunks are still stored and searched with keyword matching.
       let embeddings: number[][] | undefined;
       let retrievalMode: "semantic" | "keyword" = "keyword";
-      if (hasEmbeddingsConfigured()) {
+      if (hasEmbeddingsConfigured() && chunks.length > 0) {
         try {
           embeddings = await embedTexts(chunks.map((c) => c.content));
           retrievalMode = "semantic";
@@ -85,11 +97,26 @@ export const processSource = internalAction({
         }
       }
 
-      await ctx.runMutation(internal.processSource.writeChunksAndFinalize, {
+      // Write chunks in small batches (first batch replaces anything from a
+      // previous attempt) so large textbooks fit in each transaction.
+      for (let i = 0; i < chunks.length; i += CHUNK_WRITE_BATCH) {
+        const batch = chunks.slice(i, i + CHUNK_WRITE_BATCH);
+        await ctx.runMutation(internal.processSource.writeChunksAndFinalize, {
+          sourceId: args.sourceId,
+          userId: args.userId,
+          chunks: batch,
+          embeddings: embeddings?.slice(i, i + CHUNK_WRITE_BATCH),
+          replaceExisting: i === 0,
+          pageCount: i === 0 ? pages.length : undefined,
+          topicsDetected: i === 0 ? topics : undefined,
+          retrievalMode,
+        });
+      }
+
+      await ctx.runMutation(internal.processSource.markSourceReady, {
         sourceId: args.sourceId,
         userId: args.userId,
-        chunks,
-        embeddings,
+        chunkCount: chunks.length,
         pageCount: pages.length,
         topicsDetected: topics,
         retrievalMode,
@@ -178,6 +205,7 @@ export const writeChunksAndFinalize = internalMutation({
       }),
     ),
     embeddings: v.optional(v.array(v.array(v.float64()))),
+    replaceExisting: v.optional(v.boolean()),
     pageCount: v.optional(v.number()),
     topicsDetected: v.optional(v.array(v.string())),
     retrievalMode: v.union(v.literal("semantic"), v.literal("keyword")),
@@ -186,13 +214,16 @@ export const writeChunksAndFinalize = internalMutation({
     const source = await ctx.db.get(args.sourceId);
     if (!source || source.userId !== args.userId) return;
 
-    // Replace any previously stored chunks (re-processing).
-    const existing = await ctx.db
-      .query("chunks")
-      .withIndex("by_source", (q) => q.eq("sourceId", args.sourceId))
-      .collect();
-    for (const chunk of existing) {
-      await ctx.db.delete(chunk._id);
+    // First batch of a (re)processing run: replace any previously stored
+    // chunks so re-tries don't duplicate passages.
+    if (args.replaceExisting) {
+      const existing = await ctx.db
+        .query("chunks")
+        .withIndex("by_source", (q) => q.eq("sourceId", args.sourceId))
+        .collect();
+      for (const chunk of existing) {
+        await ctx.db.delete(chunk._id);
+      }
     }
 
     for (let i = 0; i < args.chunks.length; i++) {
@@ -208,12 +239,51 @@ export const writeChunksAndFinalize = internalMutation({
     }
 
     await ctx.db.patch(args.sourceId, {
+      ...(args.pageCount !== undefined && { pageCount: args.pageCount }),
+      ...(args.topicsDetected !== undefined && {
+        topicsDetected: args.topicsDetected,
+      }),
+      retrievalMode: args.retrievalMode,
+      updatedAt: Date.now(),
+    });
+  },
+});
+
+export const markSourceReady = internalMutation({
+  args: {
+    sourceId: v.id("sources"),
+    userId: v.id("users"),
+    chunkCount: v.number(),
+    pageCount: v.optional(v.number()),
+    topicsDetected: v.optional(v.array(v.string())),
+    retrievalMode: v.union(v.literal("semantic"), v.literal("keyword")),
+  },
+  handler: async (ctx, args) => {
+    const source = await ctx.db.get(args.sourceId);
+    if (!source || source.userId !== args.userId) return;
+    await ctx.db.patch(args.sourceId, {
       status: "ready",
-      chunkCount: args.chunks.length,
+      chunkCount: args.chunkCount,
       pageCount: args.pageCount,
       topicsDetected: args.topicsDetected,
       retrievalMode: args.retrievalMode,
       error: undefined,
+      updatedAt: Date.now(),
+    });
+  },
+});
+
+export const markSourceProgress = internalMutation({
+  args: {
+    sourceId: v.id("sources"),
+    userId: v.id("users"),
+    pageCount: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const source = await ctx.db.get(args.sourceId);
+    if (!source || source.userId !== args.userId) return;
+    await ctx.db.patch(args.sourceId, {
+      ...(args.pageCount !== undefined && { pageCount: args.pageCount }),
       updatedAt: Date.now(),
     });
   },

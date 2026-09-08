@@ -71,6 +71,34 @@ export const createSource = mutation({
   },
 });
 
+/**
+ * Re-run the extraction/embedding pipeline for a source that failed or got
+ * stuck while processing. Uses the same storage blob, so no re-upload needed.
+ */
+export const retrySource = mutation({
+  args: { sourceId: v.id("sources") },
+  handler: async (ctx, args) => {
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) throw new Error("Not authenticated");
+    const source = await ctx.db.get(args.sourceId);
+    if (!source || source.userId !== userId) throw new Error("Source not found");
+    if (source.status === "ready") throw new Error("Source is already ready");
+
+    await ctx.db.patch(args.sourceId, {
+      status: "queued",
+      error: undefined,
+      updatedAt: Date.now(),
+    });
+
+    await ctx.scheduler.runAfter(0, internal.processSource.processSource, {
+      sourceId: args.sourceId,
+      userId,
+      storageId: source.storageId,
+      type: source.type,
+    });
+  },
+});
+
 export const deleteSource = action({
   args: { sourceId: v.id("sources") },
   handler: async (ctx, args) => {
