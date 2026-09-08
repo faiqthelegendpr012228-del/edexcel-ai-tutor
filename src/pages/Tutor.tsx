@@ -7,6 +7,10 @@ import {
   ModeBadge,
   TypingDots,
 } from "@/components/ChatMessage";
+import {
+  VisualizationFrame,
+  VisualizationSkeleton,
+} from "@/components/VisualizationFrame";
 import { Button } from "@/components/ui/button";
 import {
   Popover,
@@ -32,6 +36,7 @@ import { formatDistanceToNow } from "date-fns";
 import {
   ArrowLeft,
   BookOpenCheck,
+  Expand,
   GraduationCap,
   History,
   Layers,
@@ -334,7 +339,14 @@ function AssistantBubble({
 }) {
   const navigate = useNavigate();
   const generateCards = useAction(api.practice.generateFromMessage);
+  const generateVis = useAction(api.visualizations.generateFromMessage);
+  const removeVis = useMutation(api.visualizations.remove);
+  const visualizations = useQuery(
+    api.visualizations.listForMessage,
+    message.status === "complete" ? { messageId: message._id } : "skip",
+  );
   const [generatingCards, setGeneratingCards] = useState(false);
+  const [generatingVis, setGeneratingVis] = useState(false);
 
   const thinking =
     (message.status === "thinking" || message.status === "streaming") &&
@@ -360,6 +372,33 @@ function AssistantBubble({
       );
     } finally {
       setGeneratingCards(false);
+    }
+  };
+
+  const handleGenerateVis = async () => {
+    if (generatingVis) return;
+    setGeneratingVis(true);
+    try {
+      await generateVis({ messageId: message._id });
+      toast.success("Visualization ready.");
+    } catch (err) {
+      toast.error(
+        err instanceof Error
+          ? err.message
+          : "Couldn't create the visualization.",
+      );
+    } finally {
+      setGeneratingVis(false);
+    }
+  };
+
+  const handleRemoveVis = async (visualizationId: string) => {
+    try {
+      await removeVis({
+        visualizationId: visualizationId as Id<"visualizations">,
+      });
+    } catch {
+      toast.error("Couldn't remove the visualization.");
     }
   };
 
@@ -401,8 +440,27 @@ function AssistantBubble({
                       <Layers className="size-3.5" />
                       {generatingCards ? "Creating flashcards…" : "Make flashcards"}
                     </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 gap-1.5 rounded-full px-2.5 text-xs text-muted-foreground"
+                      disabled={generatingVis}
+                      onClick={() => void handleGenerateVis()}
+                    >
+                      <Expand className="size-3.5" />
+                      {generatingVis ? "Building visualization…" : "Visualize it"}
+                    </Button>
                   </div>
                 )}
+              {generatingVis && <VisualizationSkeleton />}
+              {(visualizations ?? []).map((v) => (
+                <VisualizationFrame
+                  key={v._id}
+                  title={v.title}
+                  html={v.html}
+                  onDelete={() => void handleRemoveVis(v._id)}
+                />
+              ))}
               {message.needsPermission && (
                 <div className="mt-3 rounded-xl border border-amber-500/40 bg-amber-500/10 p-3">
                   <p className="text-sm font-medium text-foreground">
