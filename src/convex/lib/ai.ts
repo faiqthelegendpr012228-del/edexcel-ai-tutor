@@ -1,6 +1,11 @@
 "use node";
 
 import { vly } from "../../lib/vly-integrations";
+import {
+  GEMINI_QUICK_MODEL,
+  geminiTextCompletion,
+  hasGeminiKey,
+} from "./gemini";
 
 /**
  * Provider abstraction for the AI services the platform uses in v1.
@@ -356,6 +361,22 @@ export async function chatCompletion(
 ): Promise<ChatResult> {
   const model = opts?.model ?? MODELS.quick;
   const temperature = temperatureFor(model, opts?.temperature ?? 0.5);
+
+  // Gemini-first: when GEMINI_API_KEY is set, quick tasks run on Gemini's
+  // free-tier flash-lite model with the existing chain as fallback.
+  if (hasGeminiKey()) {
+    try {
+      const res = await geminiTextCompletion(messages, {
+        model: GEMINI_QUICK_MODEL,
+        temperature: opts?.temperature ?? 0.5,
+        maxTokens: opts?.maxTokens,
+      });
+      return res;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[ai] Gemini quick completion failed, using fallback: ${message}`);
+    }
+  }
 
   let lastError = "AI request failed";
   // One retry covers transient gateway hiccups on the lightweight tasks

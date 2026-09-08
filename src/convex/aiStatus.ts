@@ -15,8 +15,8 @@ export const getStatus = query({
       embeddingsConfigured:
         !!process.env.OPENAI_API_KEY &&
         !process.env.OPENAI_API_KEY.startsWith("sk-or-"),
-      // The VLY gateway key is injected by the platform at deploy time.
-      chatConfigured: !!process.env.VLY_INTEGRATION_KEY,
+      // Chat capability: Gemini (preferred) or the platform VLY gateway.
+      chatConfigured: !!process.env.GEMINI_API_KEY || !!process.env.VLY_INTEGRATION_KEY,
     };
   },
 });

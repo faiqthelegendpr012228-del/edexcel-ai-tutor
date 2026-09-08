@@ -214,6 +214,9 @@ export async function geminiTextCompletion(
         ...(opts?.maxTokens !== undefined
           ? { maxOutputTokens: opts.maxTokens }
           : {}),
+        // Quick tasks use small maxTokens budgets; default thinking would
+        // consume them and produce empty responses.
+        thinkingConfig: { thinkingBudget: 0 },
       },
     });
     const content = res.text ?? "";
