@@ -67,7 +67,10 @@ export const generateFromMessage = action({
     const userId = await getAuthUserId(ctx);
     if (userId === null) throw new Error("Not authenticated");
 
-    const message = await ctx.db.get(args.messageId);
+    const message = await ctx.runQuery(
+      internal.visualizationsInternal._getMessage,
+      { messageId: args.messageId },
+    );
     if (!message || message.userId !== userId) {
       throw new Error("Message not found");
     }
@@ -75,19 +78,20 @@ export const generateFromMessage = action({
       throw new Error("This answer is too short to visualize yet.");
     }
 
-    const existing = await ctx.db
-      .query("visualizations")
-      .withIndex("by_message", (q) => q.eq("messageId", args.messageId))
-      .collect();
-    if (existing.length >= MAX_PER_MESSAGE) {
+    const existingCount = await ctx.runQuery(
+      internal.visualizationsInternal._countForMessage,
+      { messageId: args.messageId },
+    );
+    if (existingCount >= MAX_PER_MESSAGE) {
       throw new Error(
         `This answer already has ${MAX_PER_MESSAGE} visualizations.`,
       );
     }
 
-    const chat = message.chatId
-      ? await ctx.db.get(message.chatId)
-      : undefined;
+    const chat = await ctx.runQuery(
+      internal.visualizationsInternal._getChatMeta,
+      { chatId: message.chatId },
+    );
 
     const context = buildContextSnippet(
       message.content,
