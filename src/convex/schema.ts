@@ -210,6 +210,20 @@ const schema = defineSchema(
       .index("by_quiz", ["quizSetId"])
       .index("by_user", ["userId"]),
 
+    // AI-generated interactive visualizations: self-contained HTML sims
+    // (canvas/SVG animation + controls) attached to a tutor answer.
+    visualizations: defineTable({
+      userId: v.id("users"),
+      chatId: v.optional(v.id("chats")),
+      messageId: v.optional(v.id("messages")),
+      title: v.string(),
+      html: v.string(),
+      createdAt: v.number(),
+    })
+      .index("by_chat", ["chatId"])
+      .index("by_message", ["messageId"])
+      .index("by_user", ["userId"]),
+
     // Chat messages. Assistant messages carry structured citations so the UI
     // can render clickable [Source: ...] chips backed by the actual passage.
     messages: defineTable({
