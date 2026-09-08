@@ -2,6 +2,7 @@ import { Button } from "@/components/ui/button";
 import { useAuth } from "@/hooks/use-auth";
 import { cn } from "@/lib/utils";
 import {
+  ClipboardList,
   Layers,
   LayoutDashboard,
   Lightbulb,
@@ -30,6 +31,7 @@ export function Wordmark({ compact = false }: { compact?: boolean }) {
 const NAV_ITEMS = [
   { to: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
   { to: "/tutor", label: "Tutor", icon: MessagesSquare },
+  { to: "/practice", label: "Exam practice", icon: ClipboardList },
   { to: "/flashcards", label: "Flashcards", icon: Layers },
   { to: "/sources", label: "Sources", icon: LibraryBig },
 ] as const;
