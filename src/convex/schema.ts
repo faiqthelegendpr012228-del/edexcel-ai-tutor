@@ -234,10 +234,13 @@ const schema = defineSchema(
       citations: v.optional(
         v.array(
           v.object({
-            sourceId: v.id("sources"),
-            sourceName: v.string(),
+            // Set for chunk-level citations from the local RAG fallback.
+            sourceId: v.optional(v.id("sources")),
+            // Set for document-level citations from Gemini File Search.
+            documentTitle: v.optional(v.string()),
+            uri: v.optional(v.string()),
             page: v.optional(v.number()),
-            snippet: v.string(),
+            snippet: v.optional(v.string()),
           }),
         ),
       ),

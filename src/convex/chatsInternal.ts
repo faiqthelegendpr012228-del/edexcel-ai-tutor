@@ -128,10 +128,11 @@ export const _finalizeMessage = internalMutation({
     citations: v.optional(
       v.array(
         v.object({
-          sourceId: v.id("sources"),
-          sourceName: v.string(),
+          sourceId: v.optional(v.id("sources")),
+          documentTitle: v.optional(v.string()),
+          uri: v.optional(v.string()),
           page: v.optional(v.number()),
-          snippet: v.string(),
+          snippet: v.optional(v.string()),
         }),
       ),
     ),

@@ -10,10 +10,15 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 export interface Citation {
-  sourceId: string;
-  sourceName: string;
+  /** Chunk-level citation from the local RAG fallback. */
+  sourceId?: string;
+  sourceName?: string;
+  /** Document-level citation from Gemini File Search. */
+  documentTitle?: string;
+  /** Raw source pointer from Gemini grounding metadata. */
+  uri?: string;
   page?: number;
-  snippet: string;
+  snippet?: string;
 }
 
 /** Markdown renderer for tutor answers. */
@@ -43,31 +48,39 @@ export function CitationList({ citations }: { citations: Citation[] }) {
   if (!citations || citations.length === 0) return null;
   return (
     <div className="mt-3 flex flex-wrap gap-1.5 border-t border-border/60 pt-3">
-      {citations.map((c, i) => (
-        <Popover key={`${c.sourceId}-${c.page ?? "np"}-${i}`}>
-          <PopoverTrigger asChild>
-            <button
-              type="button"
-              className="inline-flex max-w-full items-center gap-1 rounded-full border border-primary/25 bg-primary/5 px-2.5 py-1 text-[11px] font-medium text-primary transition-colors hover:bg-primary/10"
-            >
-              <BookOpen className="size-3 shrink-0" />
-              <span className="truncate">
-                Source: {c.sourceName}
-                {c.page ? `, Page ${c.page}` : ""}
-              </span>
-            </button>
-          </PopoverTrigger>
-          <PopoverContent align="start" className="w-80">
-            <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              {c.sourceName}
-              {c.page ? ` · Page ${c.page}` : ""}
-            </p>
-            <p className="mt-2 max-h-40 overflow-y-auto whitespace-pre-wrap text-sm leading-6 text-foreground">
-              {c.snippet}
-            </p>
-          </PopoverContent>
-        </Popover>
-      ))}
+      {citations.map((c, i) => {
+        const label = c.sourceName ?? c.documentTitle ?? "Source";
+        return (
+          <Popover
+            key={`${c.sourceId ?? c.documentTitle ?? "doc"}-${c.page ?? "np"}-${i}`}
+          >
+            <PopoverTrigger asChild>
+              <button
+                type="button"
+                className="inline-flex max-w-full items-center gap-1 rounded-full border border-primary/25 bg-primary/5 px-2.5 py-1 text-[11px] font-medium text-primary transition-colors hover:bg-primary/10"
+              >
+                <BookOpen className="size-3 shrink-0" />
+                <span className="truncate">
+                  Source: {label}
+                  {c.page ? `, Page ${c.page}` : ""}
+                </span>
+              </button>
+            </PopoverTrigger>
+            <PopoverContent align="start" className="w-80">
+              <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                {label}
+                {c.page ? ` · Page ${c.page}` : ""}
+              </p>
+              <p className="mt-2 max-h-40 overflow-y-auto whitespace-pre-wrap text-sm leading-6 text-foreground">
+                {c.snippet ??
+                  (c.uri
+                    ? "Retrieved passage from your uploaded Edexcel documents."
+                    : "No preview available.")}
+              </p>
+            </PopoverContent>
+          </Popover>
+        );
+      })}
     </div>
   );
 }

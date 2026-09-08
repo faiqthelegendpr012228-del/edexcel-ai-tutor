@@ -8,6 +8,12 @@ import {
   streamChatCompletion,
   type ChatMessage,
 } from "./lib/ai";
+import {
+  EDEXCEL_TUTOR_SYSTEM_PROMPT,
+  geminiFileSearchStream,
+  hasGeminiKey,
+  resolveGeminiStoreName,
+} from "./lib/gemini";
 
 type Id<T extends string> = GenericId<T>;
 
@@ -430,41 +436,100 @@ export const askTutor = action({
 
       let accumulated = "";
       let lastFlushed = 0;
-      const final = await streamChatCompletion(llmMessages, (delta) => {
-        accumulated += delta;
-        if (accumulated.length - lastFlushed >= 60) {
-          lastFlushed = accumulated.length;
-          void ctx.runMutation(internal.chatsInternal._updateMessageDelta, {
-            messageId: msgId,
-            content: accumulated,
-          });
-        }
-      });
-
-      let finalContent = final.content;
+      let finalContent = "";
+      let citations: Array<{
+        documentTitle: string;
+        uri?: string;
+        snippet?: string;
+      }> = [];
       let needsPermission = false;
-      if (finalContent.includes(NEEDS_OUTSIDE_KNOWLEDGE)) {
-        needsPermission = true;
-        finalContent = finalContent.replace(NEEDS_OUTSIDE_KNOWLEDGE, "").trim();
+
+      // Primary path: Gemini File Search. Gemini retrieves from the Edexcel
+      // knowledge base automatically and returns document citations.
+      if (hasGeminiKey()) {
+        try {
+          const storeName = await resolveGeminiStoreName();
+          const contents: Array<{ role: "user" | "model"; text: string }> = [];
+          for (const m of past.slice(-10)) {
+            contents.push({
+              role: m.role === "user" ? "user" : "model",
+              text: m.content,
+            });
+          }
+          if (!allowOutside) contents.push({ role: "user", text: content });
+          const gem = await geminiFileSearchStream({
+            contents,
+            storeName,
+            onDelta: (delta) => {
+              accumulated += delta;
+              if (accumulated.length - lastFlushed >= 60) {
+                lastFlushed = accumulated.length;
+                void ctx.runMutation(internal.chatsInternal._updateMessageDelta, {
+                  messageId: msgId,
+                  content: accumulated,
+                });
+              }
+            },
+          });
+          finalContent = gem.content;
+          citations = gem.citations.map((c) => ({
+            documentTitle: c.title,
+            uri: c.uri,
+            snippet: c.snippet,
+          }));
+          needsPermission = false;
+        } catch (gemErr) {
+          const msg =
+            gemErr instanceof Error ? gemErr.message : String(gemErr);
+          console.warn(
+            `[chats] Gemini fileSearch failed, falling back to gateway chain: ${msg}`,
+          );
+          const final = await streamChatCompletion(llmMessages, (delta) => {
+            accumulated += delta;
+            if (accumulated.length - lastFlushed >= 60) {
+              lastFlushed = accumulated.length;
+              void ctx.runMutation(internal.chatsInternal._updateMessageDelta, {
+                messageId: msgId,
+                content: accumulated,
+              });
+            }
+          });
+          finalContent = final.content;
+          if (finalContent.includes(NEEDS_OUTSIDE_KNOWLEDGE)) {
+            needsPermission = true;
+            finalContent = finalContent
+              .replace(NEEDS_OUTSIDE_KNOWLEDGE, "")
+              .trim();
+          }
+        }
+      } else {
+        const final = await streamChatCompletion(llmMessages, (delta) => {
+          accumulated += delta;
+          if (accumulated.length - lastFlushed >= 60) {
+            lastFlushed = accumulated.length;
+            void ctx.runMutation(internal.chatsInternal._updateMessageDelta, {
+              messageId: msgId,
+              content: accumulated,
+            });
+          }
+        });
+        finalContent = final.content;
+        if (finalContent.includes(NEEDS_OUTSIDE_KNOWLEDGE)) {
+          needsPermission = true;
+          finalContent = finalContent.replace(NEEDS_OUTSIDE_KNOWLEDGE, "").trim();
+        }
       }
 
-      // Structured citations from the retrieved chunks.
-      const citations: Array<{
-        sourceId: Id<"sources">;
-        sourceName: string;
-        page?: number;
-        snippet: string;
-      }> = [];
-      if (sourcesMode) {
+      // Structured citations from the retrieved chunks (fallback path only —
+      // the Gemini path returns document citations from grounding metadata).
+      if (citations.length === 0 && sourcesMode) {
         const seen = new Set<string>();
         for (const c of contextChunks) {
           const key = `${c.sourceId}:${c.page ?? 0}`;
           if (seen.has(key)) continue;
           seen.add(key);
           citations.push({
-            sourceId: c.sourceId,
-            sourceName: sourceNames.get(c.sourceId) ?? "Uploaded source",
-            page: c.page,
+            documentTitle: sourceNames.get(c.sourceId) ?? "Uploaded source",
             snippet: c.content.slice(0, 400),
           });
           if (citations.length >= 6) break;
