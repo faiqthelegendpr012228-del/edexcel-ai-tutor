@@ -56,7 +56,8 @@ function mimeFor(ext) {
 }
 
 async function findStoreByDisplayName(ai) {
-  const pager = await ai.fileSearchStores.list({ config: { pageSize: 50 } });
+  // The API caps pageSize at 20.
+  const pager = await ai.fileSearchStores.list({ config: { pageSize: 20 } });
   for await (const store of pager) {
     if (store.displayName === STORE_DISPLAY_NAME && store.name) return store.name;
   }
@@ -142,7 +143,7 @@ async function upload(fileArg, displayNameArg) {
 
 async function list() {
   const ai = client();
-  const pager = await ai.fileSearchStores.list({ config: { pageSize: 50 } });
+  const pager = await ai.fileSearchStores.list({ config: { pageSize: 20 } });
   let any = false;
   for await (const store of pager) {
     any = true;
@@ -150,7 +151,7 @@ async function list() {
     if (store.displayName === STORE_DISPLAY_NAME) {
       const docs = await ai.fileSearchStores.documents.list({
         parent: store.name,
-        config: { pageSize: 50 },
+        config: { pageSize: 20 },
       });
       for await (const doc of docs) {
         console.log(`   - ${doc.displayName ?? doc.name}`);

@@ -42,7 +42,8 @@ export async function resolveGeminiStoreName(): Promise<string> {
   const envName = process.env.GEMINI_FILE_SEARCH_STORE;
   if (envName) return envName;
   const ai = getGeminiClient();
-  const pager = await ai.fileSearchStores.list({ config: { pageSize: 50 } });
+  // The API caps pageSize at 20.
+  const pager = await ai.fileSearchStores.list({ config: { pageSize: 20 } });
   for await (const store of pager) {
     if (store.displayName === GEMINI_STORE_DISPLAY_NAME && store.name) {
       return store.name;
