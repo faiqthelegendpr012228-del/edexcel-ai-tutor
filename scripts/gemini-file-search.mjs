@@ -126,15 +126,27 @@ async function upload(fileArg, displayNameArg) {
   const displayName =
     displayNameArg ?? basename(filePath, extname(filePath)).replace(/[-_]+/g, " ");
 
+  // Shared board documents (specs, past papers, mark schemes) are tagged
+  // owner="shared" so every student's tutor can search them. Student uploads
+  // through the app are tagged owner=<userId> instead. Optionally scope a
+  // shared doc to one subject: bun … upload ./file.pdf "Name" --subject Biology
+  const subjectFlagIdx = process.argv.indexOf("--subject");
+  const subjectTag = subjectFlagIdx > -1 ? process.argv[subjectFlagIdx + 1] : undefined;
+  const metadata = [
+    { key: "owner", stringValue: "shared" },
+    { key: "uploaded_via", stringValue: "setup-script" },
+    ...(subjectTag ? [{ key: "subject", stringValue: subjectTag }] : []),
+  ];
+
   console.log(
-    `Uploading ${basename(filePath)} (${(bytes.length / 1024 / 1024).toFixed(1)} MB) as "${displayName}"…`,
+    `Uploading ${basename(filePath)} (${(bytes.length / 1024 / 1024).toFixed(1)} MB) as "${displayName}"${subjectTag ? ` [subject: ${subjectTag}]` : " [all subjects]"}…`,
   );
   const operation = await ai.fileSearchStores.uploadToFileSearchStore({
     file: new Blob([new Uint8Array(bytes)], { type: mimeFor(extname(filePath)) }),
     fileSearchStoreName: storeName,
     config: {
       displayName,
-      customMetadata: [{ key: "uploaded_via", stringValue: "setup-script" }],
+      customMetadata: metadata,
     },
   });
   await waitForOperation(ai, operation, "Indexing");

@@ -20,6 +20,7 @@ import {
 import { api } from "@/convex/_generated/api";
 import type { Doc, Id } from "@/convex/_generated/dataModel";
 import { useAction, useMutation, useQuery } from "convex/react";
+import { QUALIFICATIONS } from "@/lib/curriculum";
 import {
   AlertTriangle,
   FileText,
@@ -32,7 +33,7 @@ import {
   Trash2,
   UploadCloud,
 } from "lucide-react";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
 type SourceDoc = Doc<"sources">;
@@ -229,6 +230,7 @@ export default function Sources() {
   const sources = useQuery(api.sources.listSources);
   const collections = useQuery(api.sources.listCollections);
   const aiStatus = useQuery(api.aiStatus.getStatus);
+  const profile = useQuery(api.profiles.getMyProfile);
 
   const generateUploadUrl = useMutation(api.sources.generateUploadUrl);
   const createSource = useMutation(api.sources.createSource);
@@ -242,7 +244,20 @@ export default function Sources() {
   const [activeCollection, setActiveCollection] = useState<string>("all");
   const [newCollectionOpen, setNewCollectionOpen] = useState(false);
   const [newCollectionName, setNewCollectionName] = useState("");
+  // Subject tag applied to uploads. Defaults to the student's focus subject
+  // from onboarding; the options come from the profile's qualification only,
+  // so the list always matches the dashboard's subject selector.
+  const [uploadSubject, setUploadSubject] = useState<string>("");
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const qualificationSubjects = useMemo(() => {
+    const qual = QUALIFICATIONS.find((q) => q.id === profile?.qualification);
+    return qual?.subjects ?? [];
+  }, [profile?.qualification]);
+
+  useEffect(() => {
+    if (profile?.subject) setUploadSubject(profile.subject);
+  }, [profile?.subject]);
 
   const allSources = sources ?? [];
   const filtered = useMemo(
@@ -254,6 +269,10 @@ export default function Sources() {
   );
 
   const uploadFiles = async (files: Iterable<File>) => {
+    if (!uploadSubject) {
+      toast.error("Pick a subject for these files first.");
+      return;
+    }
     setUploading((n) => n + 1);
     try {
       for (const file of files) {
@@ -280,12 +299,15 @@ export default function Sources() {
             name: file.name,
             type,
             size: file.size,
+            subject: uploadSubject,
             collectionId:
               activeCollection === "all"
                 ? undefined
                 : (activeCollection as Id<"collections">),
           });
-          toast.success(`${file.name} uploaded — processing now.`);
+          toast.success(
+            `${file.name} uploaded as ${uploadSubject} — processing now.`,
+          );
         } catch (err) {
           toast.error(
             `${file.name}: ${err instanceof Error ? err.message : "upload failed"}`,
@@ -425,6 +447,40 @@ export default function Sources() {
           </p>
           <p className="mt-1 text-xs text-muted-foreground">
             PDF, Word, PowerPoint, TXT or MD — up to 600 pages each
+          </p>
+        </div>
+
+        {/* Subject tag for uploads — mirrors the dashboard's focus-subject
+            list for the student's own qualification. */}
+        <div className="mt-4 flex flex-col items-center gap-2">
+          <label className="text-xs font-medium text-muted-foreground">
+            Subject for these files
+          </label>
+          <Select
+            value={uploadSubject}
+            onValueChange={setUploadSubject}
+          >
+            <SelectTrigger className="w-64">
+              <SelectValue
+                placeholder={
+                  qualificationSubjects.length === 0
+                    ? "Complete onboarding to pick a subject"
+                    : "Pick a subject"
+                }
+              />
+            </SelectTrigger>
+            <SelectContent>
+              {qualificationSubjects.map((s) => (
+                <SelectItem key={s.id} value={s.name}>
+                  {s.name}
+                </SelectItem>
+              ))
+              }
+            </SelectContent>
+          </Select>
+          <p className="text-[11px] text-muted-foreground">
+            Answers in a subject's tutor only search files tagged with that
+            same subject.
           </p>
         </div>
 

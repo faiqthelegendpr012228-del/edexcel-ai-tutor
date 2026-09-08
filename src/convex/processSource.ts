@@ -8,6 +8,11 @@ import {
   normalizeExtractedText,
   type Chunk,
 } from "./lib/extract";
+import {
+  hasGeminiKey,
+  resolveGeminiStoreName,
+  uploadToGeminiStore,
+} from "./lib/gemini";
 
 // Internal source-processing pipeline (scheduled from `createSource` and
 // `retrySource`). Lives in its own module so `sources.ts` can reference these
@@ -380,3 +385,83 @@ export const _getSource = internalQuery({
     return await ctx.db.get(args.sourceId);
   },
 });
+
+export const setGeminiDocName = internalMutation({
+  args: {
+    sourceId: v.id("sources"),
+    userId: v.id("users"),
+    geminiDocName: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const source = await ctx.db.get(args.sourceId);
+    if (!source || source.userId !== args.userId) return;
+    await ctx.db.patch(args.sourceId, {
+      geminiDocName: args.geminiDocName,
+      updatedAt: Date.now(),
+    });
+  },
+});
+
+/**
+ * Push the uploaded file into the Gemini File Search Store tagged with the
+ * owner and subject metadata, so tutor answers can be scoped per student and
+ * per subject. Runs alongside (not inside) the local extraction pipeline.
+ */
+export const uploadToGemini = internalAction({
+  args: {
+    sourceId: v.id("sources"),
+    userId: v.id("users"),
+    storageId: v.id("_storage"),
+  },
+  handler: async (ctx, args) => {
+    if (!hasGeminiKey()) return;
+    const source = await ctx.runQuery(internal.processSource._getSource, {
+      sourceId: args.sourceId,
+    });
+    if (!source || source.userId !== args.userId) return;
+    if (source.geminiDocName) return; // already indexed
+
+    try {
+      const storeName = await resolveGeminiStoreName();
+      const file = await ctx.storage.get(args.storageId);
+      if (!file) return;
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const mimeType = geminiMimeForType(source.type);
+      const docName = await uploadToGeminiStore({
+        storeName,
+        bytes,
+        mimeType,
+        displayName: source.name,
+        ownerUserId: args.userId,
+        subject: source.subject,
+      });
+      await ctx.runMutation(internal.processSource.setGeminiDocName, {
+        sourceId: args.sourceId,
+        userId: args.userId,
+        geminiDocName: docName,
+      });
+    } catch (err) {
+      // Non-fatal: local keyword search still works without the Gemini copy.
+      console.error(
+        `[sources] Gemini upload failed for ${args.sourceId}: ${err instanceof Error ? err.message : err}`,
+      );
+    }
+  },
+});
+
+function geminiMimeForType(type: string): string {
+  switch (type) {
+    case "pdf":
+      return "application/pdf";
+    case "docx":
+      return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    case "pptx":
+      return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+    case "txt":
+      return "text/plain";
+    case "md":
+      return "text/markdown";
+    default:
+      return "application/octet-stream";
+  }
+}

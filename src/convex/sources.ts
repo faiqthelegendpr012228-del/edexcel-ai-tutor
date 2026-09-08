@@ -67,6 +67,14 @@ export const createSource = mutation({
       type: args.type,
     });
 
+    // Mirror the file into the Gemini File Search Store (when configured) so
+    // tutor answers can ground against it, scoped by subject metadata.
+    await ctx.scheduler.runAfter(0, internal.processSource.uploadToGemini, {
+      sourceId,
+      userId,
+      storageId: args.storageId,
+    });
+
     return sourceId;
   },
 });
@@ -110,6 +118,18 @@ export const deleteSource = action({
     });
     if (!source || source.userId !== userId) {
       throw new Error("Source not found");
+    }
+
+    // Best-effort removal from the Gemini File Search Store.
+    if (source.geminiDocName) {
+      try {
+        const { deleteFromGeminiStore } = await import("./lib/gemini");
+        await deleteFromGeminiStore(source.geminiDocName);
+      } catch (err) {
+        console.warn(
+          `[sources] Gemini delete failed for ${args.sourceId}: ${err instanceof Error ? err.message : err}`,
+        );
+      }
     }
 
     await ctx.storage.delete(source.storageId);

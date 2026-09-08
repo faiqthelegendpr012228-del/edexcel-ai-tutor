@@ -141,6 +141,8 @@ export async function geminiFileSearchStream(
     storeName: string;
     model?: string;
     systemPrompt?: string;
+    /** Optional AIP-160 filter, e.g. `subject = "Biology" AND owner = "user_123"`. */
+    metadataFilter?: string;
     onDelta: (delta: string) => void;
   },
 ): Promise<GeminiChatResult> {
@@ -155,7 +157,16 @@ export async function geminiFileSearchStream(
     })),
     config: {
       systemInstruction: opts.systemPrompt ?? EDEXCEL_TUTOR_SYSTEM_PROMPT,
-      tools: [{ fileSearch: { fileSearchStoreNames: [opts.storeName] } }],
+      tools: [
+        {
+          fileSearch: {
+            fileSearchStoreNames: [opts.storeName],
+            ...(opts.metadataFilter
+              ? { metadataFilter: opts.metadataFilter }
+              : {}),
+          },
+        },
+      ],
     },
   });
 
@@ -179,6 +190,64 @@ export async function geminiFileSearchStream(
     content,
     citations: extractGroundingCitations(groundingMetadata),
   };
+}
+
+/**
+ * Upload a file into the File Search Store with per-user/per-subject custom
+ * metadata so retrieval can be scoped per student and subject. Returns the
+ * document resource name once indexing completes.
+ */
+export async function uploadToGeminiStore(
+  opts: {
+    storeName: string;
+    bytes: Uint8Array;
+    mimeType: string;
+    displayName: string;
+    ownerUserId: string;
+    subject?: string;
+  },
+): Promise<string> {
+  const ai = getGeminiClient();
+  const operation = await ai.fileSearchStores.uploadToFileSearchStore({
+    file: new Blob([opts.bytes.buffer as ArrayBuffer], {
+      type: opts.mimeType,
+    }),
+    fileSearchStoreName: opts.storeName,
+    config: {
+      displayName: opts.displayName,
+      customMetadata: [
+        { key: "owner", stringValue: opts.ownerUserId },
+        ...(opts.subject ? [{ key: "subject", stringValue: opts.subject }] : []),
+      ],
+    },
+  });
+  let op = operation;
+  let waited = 0;
+  while (!op.done && waited < 120_000) {
+    await new Promise((r) => setTimeout(r, 2000));
+    waited += 2000;
+    op = await ai.operations.get({ operation: op });
+  }
+  if (!op.done) {
+    throw new Error("Gemini indexing timed out — retry from the Sources page.");
+  }
+  const response = op.response as
+    | { document?: { name?: string } }
+    | undefined;
+  const docName = response?.document?.name;
+  if (!docName) {
+    throw new Error("Gemini indexing finished but no document name was returned.");
+  }
+  return docName;
+}
+
+/** Remove a document from the File Search Store (best effort). */
+export async function deleteFromGeminiStore(docName: string): Promise<void> {
+  const ai = getGeminiClient();
+  await ai.fileSearchStores.documents.delete({
+    name: docName,
+    config: { force: true },
+  });
 }
 
 /**

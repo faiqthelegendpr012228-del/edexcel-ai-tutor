@@ -98,6 +98,10 @@ const schema = defineSchema(
       topicsDetected: v.optional(v.array(v.string())),
       retrievalMode: v.optional(retrievalModeValidator),
       error: v.optional(v.string()),
+      // Resource name of the document inside the Gemini File Search Store
+      // (e.g. fileSearchStores/…/documents/xyz). Set once the upload/index
+      // step completes; used to remove it from the store on delete.
+      geminiDocName: v.optional(v.string()),
       createdAt: v.number(),
       updatedAt: v.number(),
     })

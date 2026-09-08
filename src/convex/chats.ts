@@ -449,6 +449,13 @@ export const askTutor = action({
       if (hasGeminiKey()) {
         try {
           const storeName = await resolveGeminiStoreName();
+          // Scope retrieval to the active subject and this student's own
+          // uploads, plus any shared board documents. Subject tag is applied
+          // at upload time from the same curriculum list used across the app.
+          const subjectTag = chat.subject;
+          const filter = subjectTag
+            ? `subject = "${subjectTag.replace(/"/g, "\\\"")}" AND (owner = "${userId}" OR owner = "shared")`
+            : `owner = "${userId}" OR owner = "shared"`;
           const contents: Array<{ role: "user" | "model"; text: string }> = [];
           for (const m of past.slice(-10)) {
             contents.push({
@@ -460,6 +467,7 @@ export const askTutor = action({
           const gem = await geminiFileSearchStream({
             contents,
             storeName,
+            metadataFilter: filter,
             onDelta: (delta) => {
               accumulated += delta;
               if (accumulated.length - lastFlushed >= 60) {
