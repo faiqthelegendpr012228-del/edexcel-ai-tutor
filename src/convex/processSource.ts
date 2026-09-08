@@ -9,9 +9,9 @@ import {
   type Chunk,
 } from "./lib/extract";
 
-// Internal source-processing pipeline (scheduled from `createSource`). Lives
-// in its own module so `sources.ts` can reference these through
-// `internal.processSource.*` without circular type inference.
+// Internal source-processing pipeline (scheduled from `createSource` and
+// `retrySource`). Lives in its own module so `sources.ts` can reference these
+// through `internal.processSource.*` without circular type inference.
 
 // Sanity caps so a single upload can't blow through action timeouts/costs.
 // 600 pages covers full textbooks; chunking keeps ~1500 chars per passage.
@@ -20,6 +20,9 @@ const MAX_CHUNKS = 2000;
 // Chunks are written in small batches so large books stay well under the
 // per-transaction document-size limit.
 const CHUNK_WRITE_BATCH = 50;
+// PDF pages are extracted in parallel slices to cut wall-clock time on
+// multi-hundred-page textbooks (text extraction is CPU-bound per page).
+const PDF_EXTRACT_CONCURRENCY = 6;
 
 export const processSource = internalAction({
   args: {
@@ -50,7 +53,11 @@ export const processSource = internalAction({
       }
       const bytes = await file.arrayBuffer();
 
-      const extracted = await extractText(args.type, bytes);
+      // Parallel page extraction inside extractText (PDF pages are pulled in
+      // slices of PDF_EXTRACT_CONCURRENCY).
+      const extracted = await extractText(args.type, bytes, {
+        pageConcurrency: PDF_EXTRACT_CONCURRENCY,
+      });
       const pages = extracted.pages.slice(0, MAX_PAGES_PROCESSED);
       const text = normalizeExtractedText(extracted.text);
       if (!text) {
@@ -70,47 +77,97 @@ export const processSource = internalAction({
 
       const chunks = chunkDocument({ ...extracted, pages }).slice(0, MAX_CHUNKS);
 
-      // Semantic retrieval when the deployment has an OpenAI key; otherwise
-      // the chunks are still stored and searched with keyword matching.
-      let embeddings: number[][] | undefined;
+      // -------------------------------------------------------------------
+      // Embed + write as one pipeline: while the DB write for batch N runs,
+      // the embedding request for batch N+1 is already in flight. This hides
+      // embedding latency behind writes and is the main wall-clock win for
+      // big books. If an embed batch fails, the source falls back to keyword
+      // mode with whatever was written so far.
+      // -------------------------------------------------------------------
       let retrievalMode: "semantic" | "keyword" = "keyword";
-      if (hasEmbeddingsConfigured() && chunks.length > 0) {
+      let pipelineSucceeded = false;
+      const hasEmbeddings = hasEmbeddingsConfigured();
+      let topics: string[] | undefined;
+
+      if (hasEmbeddings && chunks.length > 0) {
         try {
-          embeddings = await embedTexts(chunks.map((c) => c.content));
-          retrievalMode = "semantic";
+          const EMBED_BATCH = 32;
+          let nextEmbed = 0;
+          let inFlight: Promise<number[][]> | null = null;
+
+          const startNextEmbed = (): boolean => {
+            if (nextEmbed >= chunks.length) return false;
+            const slice = chunks.slice(nextEmbed, nextEmbed + EMBED_BATCH);
+            nextEmbed += EMBED_BATCH;
+            inFlight = embedTexts(slice.map((c) => c.content)).then(
+              (vecs) => vecs,
+              () => {
+                failedEmbed = true;
+                return [] as number[][];
+              },
+            );
+            return true;
+          };
+
+          let pending: number[][] = [];
+          let failed = false;
+          let failedEmbed = false;
+
+          for (let i = 0; i < chunks.length && !failed; i += CHUNK_WRITE_BATCH) {
+            const writeBatch = chunks.slice(i, i + CHUNK_WRITE_BATCH);
+            const writeBatchEmbeds: number[][] = [];
+
+            while (writeBatchEmbeds.length < writeBatch.length) {
+              if (pending.length > 0) {
+                const take = Math.min(
+                  pending.length,
+                  writeBatch.length - writeBatchEmbeds.length,
+                );
+                writeBatchEmbeds.push(...pending.splice(0, take));
+              } else if (inFlight) {
+                const arrived = await inFlight;
+                inFlight = null;
+                if (failedEmbed) {
+                  failed = true;
+                  break;
+                }
+                pending = arrived;
+              } else if (!startNextEmbed()) {
+                break;
+              }
+            }
+
+            if (failed) break;
+
+            await ctx.runMutation(internal.processSource.writeChunks, {
+              sourceId: args.sourceId,
+              userId: args.userId,
+              chunks: writeBatch,
+              embeddings: writeBatchEmbeds,
+              replaceExisting: i === 0,
+              pageCount: i === 0 ? pages.length : undefined,
+            });
+
+            // Kick off the next embed batch while nothing else is pending.
+            startNextEmbed();
+          }
+
+          pipelineSucceeded = !failed;
         } catch (err) {
-          const message =
-            err instanceof Error ? err.message : "Embedding failed";
-          // Keyword fallback — the source remains fully usable.
           console.warn(
-            `[sources] Embedding failed for ${args.sourceId}, using keyword search: ${message}`,
+            `[sources] Embedding pipeline failed for ${args.sourceId}, falling back to keyword: ${err instanceof Error ? err.message : err}`,
           );
         }
       }
 
-      let topics: string[] | undefined;
-      if (retrievalMode === "keyword") {
+      if (pipelineSucceeded) {
+        retrievalMode = "semantic";
+      } else {
         try {
           topics = await detectTopics(text.slice(0, 6000));
         } catch {
           topics = undefined;
         }
-      }
-
-      // Write chunks in small batches (first batch replaces anything from a
-      // previous attempt) so large textbooks fit in each transaction.
-      for (let i = 0; i < chunks.length; i += CHUNK_WRITE_BATCH) {
-        const batch = chunks.slice(i, i + CHUNK_WRITE_BATCH);
-        await ctx.runMutation(internal.processSource.writeChunksAndFinalize, {
-          sourceId: args.sourceId,
-          userId: args.userId,
-          chunks: batch,
-          embeddings: embeddings?.slice(i, i + CHUNK_WRITE_BATCH),
-          replaceExisting: i === 0,
-          pageCount: i === 0 ? pages.length : undefined,
-          topicsDetected: i === 0 ? topics : undefined,
-          retrievalMode,
-        });
       }
 
       await ctx.runMutation(internal.processSource.markSourceReady, {
@@ -193,7 +250,7 @@ export const markSourceFailed = internalMutation({
   },
 });
 
-export const writeChunksAndFinalize = internalMutation({
+export const writeChunks = internalMutation({
   args: {
     sourceId: v.id("sources"),
     userId: v.id("users"),
@@ -207,8 +264,6 @@ export const writeChunksAndFinalize = internalMutation({
     embeddings: v.optional(v.array(v.array(v.float64()))),
     replaceExisting: v.optional(v.boolean()),
     pageCount: v.optional(v.number()),
-    topicsDetected: v.optional(v.array(v.string())),
-    retrievalMode: v.union(v.literal("semantic"), v.literal("keyword")),
   },
   handler: async (ctx, args) => {
     const source = await ctx.db.get(args.sourceId);
@@ -240,10 +295,6 @@ export const writeChunksAndFinalize = internalMutation({
 
     await ctx.db.patch(args.sourceId, {
       ...(args.pageCount !== undefined && { pageCount: args.pageCount }),
-      ...(args.topicsDetected !== undefined && {
-        topicsDetected: args.topicsDetected,
-      }),
-      retrievalMode: args.retrievalMode,
       updatedAt: Date.now(),
     });
   },

@@ -29,11 +29,12 @@ export class UnsupportedFormatError extends Error {
 export async function extractText(
   type: string,
   bytes: ArrayBuffer,
+  opts?: { pageConcurrency?: number },
 ): Promise<ExtractedDocument> {
   const buffer = Buffer.from(bytes);
   switch (type) {
     case "pdf":
-      return extractPdf(buffer);
+      return extractPdf(buffer, opts?.pageConcurrency ?? 6);
     case "docx":
       return extractDocx(buffer);
     case "pptx":
@@ -52,16 +53,19 @@ export async function extractText(
 
 // PDF text extraction is provided by `pdfjs-dist` (legacy build), imported
 // lazily so this module bundles cleanly. See extractPdf below.
-// NOTE: temporarily stubbed until pdfjs-dist is installed.
-async function extractPdf(buffer: Buffer): Promise<ExtractedDocument> {
+async function extractPdf(
+  buffer: Buffer,
+  pageConcurrency: number,
+): Promise<ExtractedDocument> {
   const pdfjs = await importPdfjs();
   const doc = await pdfjs.getDocument({
     data: new Uint8Array(buffer),
   }).promise;
   try {
-    const pages: ExtractedPage[] = [];
-    const parts: string[] = [];
-    for (let n = 1; n <= doc.numPages; n++) {
+    const total = doc.numPages;
+    const pages: ExtractedPage[] = new Array(total);
+
+    const extractPage = async (n: number) => {
       const page = await doc.getPage(n);
       const content = await page.getTextContent();
       let text = "";
@@ -74,13 +78,29 @@ async function extractPdf(buffer: Buffer): Promise<ExtractedDocument> {
         if (item.hasEOL) text += "\n";
       }
       text = text.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
-      pages.push({ num: n, text });
-      if (text) parts.push(text);
+      pages[n - 1] = { num: n, text };
+    };
+
+    // Text extraction is CPU-bound per page, so pages are processed in
+    // parallel slices — this is the single biggest wall-clock win for
+    // multi-hundred-page textbooks. Results land in page order.
+    for (let start = 1; start <= total; start += pageConcurrency) {
+      const end = Math.min(start + pageConcurrency - 1, total);
+      const group: Promise<void>[] = [];
+      for (let n = start; n <= end; n++) {
+        group.push(extractPage(n));
+      }
+      await Promise.all(group);
+    }
+
+    const parts: string[] = [];
+    for (const p of pages) {
+      if (p && p.text) parts.push(p.text);
     }
     return {
       text: parts.join("\n\n"),
       pages,
-      pageCount: doc.numPages,
+      pageCount: total,
     };
   } finally {
     await doc.destroy().catch(() => undefined);
