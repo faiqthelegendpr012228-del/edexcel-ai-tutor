@@ -1,5 +1,6 @@
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { v } from "convex/values";
+import type { Id } from "./_generated/dataModel";
 import { action, mutation, query } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { chatCompletion } from "./lib/ai";
@@ -63,7 +64,10 @@ function buildContextSnippet(
 
 export const generateFromMessage = action({
   args: { messageId: v.id("messages") },
-  handler: async (ctx, args) => {
+  handler: async (
+    ctx,
+    args,
+  ): Promise<{ visualizationId: Id<"visualizations">; title: string }> => {
     const userId = await getAuthUserId(ctx);
     if (userId === null) throw new Error("Not authenticated");
 
