@@ -11,7 +11,9 @@ import { vly } from "../../lib/vly-integrations";
  *   against the key stored in OPENAI_API_KEY. That key may be a real OpenAI
  *   key (api.openai.com) OR an OpenRouter key (`sk-or-v1…`, openrouter.ai) —
  *   both speak the same chat-completions protocol, so both are supported and
- *   routed to the right host automatically.
+ *   routed to the right host automatically. OpenRouter 402 (low credits) is
+ *   handled by retrying with the token budget the account can actually
+ *   afford.
  * - Embeddings: OpenAI `text-embedding-3-small` via direct API. Requires a
  *   real OpenAI key (OpenRouter does not expose an embeddings endpoint).
  *   When unavailable, the RAG pipeline gracefully falls back to keyword
@@ -32,10 +34,7 @@ export const MODELS = {
 
 export class EmbeddingsNotConfiguredError extends Error {
   constructor(reason?: string) {
-    super(
-      reason ??
-        "OPENAI_API_KEY is not configured",
-    );
+    super(reason ?? "OPENAI_API_KEY is not configured");
     this.name = "EmbeddingsNotConfiguredError";
   }
 }
@@ -88,6 +87,40 @@ function temperatureFor(model: string, requested?: number): number | undefined {
   return requested ?? 0.7;
 }
 
+/** HTTP error from a direct AI call, carrying the status and response body. */
+class AIHttpError extends Error {
+  status: number;
+  body: string;
+  constructor(status: number, body: string) {
+    super(`AI request failed (${status}): ${body.slice(0, 300)}`);
+    this.name = "AIHttpError";
+    this.status = status;
+    this.body = body;
+  }
+}
+
+/**
+ * OpenRouter 402 responses state the affordable budget, e.g.
+ * "You requested up to 16384 tokens, but can only afford 3447."
+ * Extract that number so the request can be retried within budget.
+ */
+function parseAffordableTokens(body: string): number | null {
+  const m = body.match(/can only afford (\d+)/i);
+  if (!m) return null;
+  const n = Number.parseInt(m[1], 10);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function friendlyAuthError(openRouter: boolean): string {
+  return openRouter
+    ? "Your OpenRouter key was rejected (401). Check OPENAI_API_KEY in the Keys panel — it must be a valid `sk-or-…` key with credit available."
+    : "Your OPENAI_API_KEY was rejected (401 invalid_api_key). Check it in the Keys panel — it must be a real OpenAI key starting with `sk-`, not an OpenRouter key (`sk-or-…`).";
+}
+
+function outOfCreditsError(): string {
+  return "Your OpenRouter account doesn't have enough credits for this request. Top up at https://openrouter.ai/settings/credits, or add a real OpenAI key in the Keys panel.";
+}
+
 /**
  * Direct chat completion against the key in OPENAI_API_KEY. Used as a
  * reliability fallback when the VLY gateway rejects the request so the
@@ -97,7 +130,10 @@ function temperatureFor(model: string, requested?: number): number | undefined {
  *   `max_completion_tokens` and no custom temperature; standard models take
  *   `max_tokens` + `temperature`.
  * - OpenRouter key (`sk-or-…`) → openrouter.ai with vendor-prefixed model
- *   slugs and `max_tokens`.
+ *   slugs and `max_tokens`. A 402 (credits too low for the requested token
+ *   budget) is automatically retried with the affordable budget parsed from
+ *   the error, so small/medium answers still go through on a low-balance
+ *   account.
  */
 async function directOpenAIChat(
   messages: ChatMessage[],
@@ -110,28 +146,38 @@ async function directOpenAIChat(
     throw new Error("No OPENAI_API_KEY configured for direct fallback");
   }
   const openRouter = isOpenRouterKey(key);
+  const endpoint = openRouter
+    ? "https://openrouter.ai/api/v1/chat/completions"
+    : "https://api.openai.com/v1/chat/completions";
 
-  const body: Record<string, unknown> = {
-    model: openRouter ? openRouterModelName(model) : model,
-    messages,
-  };
-  if (openRouter) {
-    if (maxTokens !== undefined) body.max_tokens = maxTokens;
-    if (!isReasoningModel(model) && temperature !== undefined) {
-      body.temperature = temperature;
+  const buildBody = (tokenBudget?: number): Record<string, unknown> => {
+    const effective = tokenBudget ?? maxTokens;
+    const body: Record<string, unknown> = {
+      model: openRouter ? openRouterModelName(model) : model,
+      messages,
+    };
+    if (openRouter) {
+      if (effective !== undefined) body.max_tokens = effective;
+      if (!isReasoningModel(model) && temperature !== undefined) {
+        body.temperature = temperature;
+      }
+    } else if (isReasoningModel(model)) {
+      if (effective !== undefined) body.max_completion_tokens = effective;
+    } else {
+      if (temperature !== undefined) body.temperature = temperature;
+      if (effective !== undefined) body.max_tokens = effective;
     }
-  } else if (isReasoningModel(model)) {
-    if (maxTokens !== undefined) body.max_completion_tokens = maxTokens;
-  } else {
-    if (temperature !== undefined) body.temperature = temperature;
-    if (maxTokens !== undefined) body.max_tokens = maxTokens;
-  }
+    return body;
+  };
 
-  const res = await fetch(
-    openRouter
-      ? "https://openrouter.ai/api/v1/chat/completions"
-      : "https://api.openai.com/v1/chat/completions",
-    {
+  const post = async (
+    body: Record<string, unknown>,
+  ): Promise<{
+    content: string;
+    promptTokens: number;
+    completionTokens: number;
+  }> => {
+    const res = await fetch(endpoint, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -139,34 +185,47 @@ async function directOpenAIChat(
         ...(openRouter && { "X-Title": "Lumen Tutor" }),
       },
       body: JSON.stringify(body),
-    },
-  );
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    if (res.status === 401) {
-      throw new Error(
-        openRouter
-          ? "Your OpenRouter key was rejected (401). Check OPENAI_API_KEY in the Keys panel — it must be a valid `sk-or-…` key with credit available."
-          : "Your OPENAI_API_KEY was rejected (401 invalid_api_key). Check it in the Keys panel — it must be a real OpenAI key starting with `sk-`, not an OpenRouter key (`sk-or-…`).",
-      );
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      if (res.status === 401) throw new Error(friendlyAuthError(openRouter));
+      throw new AIHttpError(res.status, text);
     }
-    throw new Error(
-      `AI request failed (${res.status}): ${text.slice(0, 300)}`,
-    );
-  }
-  const data = (await res.json()) as {
-    choices?: Array<{ message?: { content?: string } }>;
-    usage?: { prompt_tokens?: number; completion_tokens?: number };
+    const data = (await res.json()) as {
+      choices?: Array<{ message?: { content?: string } }>;
+      usage?: { prompt_tokens?: number; completion_tokens?: number };
+    };
+    const content = data.choices?.[0]?.message?.content ?? "";
+    if (!content.trim()) {
+      throw new Error("The model returned an empty response.");
+    }
+    return {
+      content,
+      promptTokens: data.usage?.prompt_tokens ?? 0,
+      completionTokens: data.usage?.completion_tokens ?? 0,
+    };
   };
-  const content = data.choices?.[0]?.message?.content ?? "";
-  if (!content.trim()) {
-    throw new Error("The model returned an empty response.");
+
+  try {
+    return await post(buildBody());
+  } catch (err) {
+    const isLowCredits =
+      err instanceof AIHttpError &&
+      (err.status === 402 ||
+        (err.status === 400 && /insufficient|credits/i.test(err.body)));
+    if (!isLowCredits) throw err;
+
+    // Retry within the budget the account can actually afford.
+    const affordable = parseAffordableTokens(err.body);
+    if (affordable !== null && affordable >= 256) {
+      try {
+        return await post(buildBody(affordable));
+      } catch {
+        throw new Error(outOfCreditsError());
+      }
+    }
+    throw new Error(outOfCreditsError());
   }
-  return {
-    content,
-    promptTokens: data.usage?.prompt_tokens ?? 0,
-    completionTokens: data.usage?.completion_tokens ?? 0,
-  };
 }
 
 export async function streamChatCompletion(
