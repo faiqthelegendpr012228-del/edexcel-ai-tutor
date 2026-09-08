@@ -155,6 +155,61 @@ const schema = defineSchema(
       createdAt: v.number(),
     }).index("by_user_due", ["userId", "nextDueAt"]),
 
+    // Exam practice: an AI-generated paper for one qualification/subject.
+    quizSets: defineTable({
+      userId: v.id("users"),
+      subject: v.string(),
+      qualification: v.optional(v.string()),
+      topic: v.optional(v.string()),
+      difficulty: v.optional(
+        v.union(
+          v.literal("foundation"),
+          v.literal("standard"),
+          v.literal("stretch"),
+        ),
+      ),
+      status: v.union(v.literal("in_progress"), v.literal("complete")),
+      // Percentage score, set when the paper is marked complete.
+      score: v.optional(v.number()),
+      createdAt: v.number(),
+      updatedAt: v.number(),
+    }).index("by_user_updated", ["userId", "updatedAt"]),
+
+    // One exam-style question in a quiz set. Generation writes the question,
+    // marks and model answer; marking fills in the student's result.
+    quizQuestions: defineTable({
+      userId: v.id("users"),
+      quizSetId: v.id("quizSets"),
+      position: v.number(),
+      question: v.string(),
+      marks: v.number(),
+      commandWord: v.optional(v.string()),
+      modelAnswer: v.string(),
+      studentAnswer: v.optional(v.string()),
+      // Marking result: earned marks + per-point feedback lines.
+      earnedMarks: v.optional(v.number()),
+      feedback: v.optional(
+        v.array(
+          v.object({
+            point: v.string(),
+            pointType: v.optional(
+              v.union(
+                v.literal("content"),
+                v.literal("structure"),
+                v.literal("calculation"),
+              ),
+            ),
+            awarded: v.boolean(),
+            comment: v.string(),
+          }),
+        ),
+      ),
+      overallComment: v.optional(v.string()),
+      answeredAt: v.optional(v.number()),
+    })
+      .index("by_quiz", ["quizSetId"])
+      .index("by_user", ["userId"]),
+
     // Chat messages. Assistant messages carry structured citations so the UI
     // can render clickable [Source: ...] chips backed by the actual passage.
     messages: defineTable({
