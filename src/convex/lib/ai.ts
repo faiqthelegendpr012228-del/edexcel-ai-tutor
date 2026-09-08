@@ -53,10 +53,29 @@ function openRouterModelName(model: string): string {
   return model.includes("/") ? model : `openai/${model}`;
 }
 
+/**
+ * Groq keys start with `gsk_`. They authenticate against api.groq.com's
+ * OpenAI-compatible endpoint and cannot be used for the embeddings API.
+ */
+export function isGroqKey(key: string | undefined): boolean {
+  return !!key && key.startsWith("gsk_");
+}
+
+/**
+ * Map internal model names to Groq's production models: tutor-grade work
+ * goes to GPT-OSS 120B, lightweight tasks to GPT-OSS 20B. Explicit Groq
+ * model ids pass through untouched.
+ */
+function groqModelName(model: string): string {
+  if (/^gpt-5/i.test(model)) return "openai/gpt-oss-120b";
+  if (/^gpt-4o/i.test(model)) return "openai/gpt-oss-20b";
+  return model;
+}
+
 export function hasEmbeddingsConfigured(): boolean {
   const key = process.env.OPENAI_API_KEY;
-  // OpenRouter keys can't call the embeddings endpoint.
-  return !!key && !isOpenRouterKey(key);
+  // OpenRouter and Groq keys can't call the embeddings endpoint.
+  return !!key && !isOpenRouterKey(key) && !isGroqKey(key);
 }
 
 export interface ChatMessage {
@@ -111,14 +130,27 @@ function parseAffordableTokens(body: string): number | null {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
-function friendlyAuthError(openRouter: boolean): string {
-  return openRouter
-    ? "Your OpenRouter key was rejected (401). Check OPENAI_API_KEY in the Keys panel — it must be a valid `sk-or-…` key with credit available."
-    : "Your OPENAI_API_KEY was rejected (401 invalid_api_key). Check it in the Keys panel — it must be a real OpenAI key starting with `sk-`, not an OpenRouter key (`sk-or-…`).";
+type DirectProvider = "openai" | "openrouter" | "groq";
+
+function friendlyAuthError(provider: DirectProvider): string {
+  switch (provider) {
+    case "openrouter":
+      return "Your OpenRouter key was rejected (401). Check OPENAI_API_KEY in the Keys panel — it must be a valid `sk-or-…` key with credit available.";
+    case "groq":
+      return "Your Groq key was rejected (401). Check OPENAI_API_KEY in the Keys panel — it must be a valid Groq key starting with `gsk_`.";
+    default:
+      return "Your OPENAI_API_KEY was rejected (401 invalid_api_key). Check it in the Keys panel — it must be a real OpenAI key starting with `sk-` (or a valid OpenRouter `sk-or-…` / Groq `gsk_` key).";
+  }
 }
 
-function outOfCreditsError(): string {
-  return "Your OpenRouter account doesn't have enough credits for this request. Top up at https://openrouter.ai/settings/credits, or add a real OpenAI key in the Keys panel.";
+function outOfCreditsError(provider: DirectProvider): string {
+  if (provider === "openrouter") {
+    return "Your OpenRouter account doesn't have enough credits for this request. Top up at https://openrouter.ai/settings/credits, or replace the key in the Keys panel.";
+  }
+  if (provider === "groq") {
+    return "Groq rejected this request. Check your key and plan limits at https://console.groq.com/settings/limits, or replace the key in the Keys panel.";
+  }
+  return "Your AI account doesn't have enough quota for this request. Check the key in the Keys panel.";
 }
 
 /**
@@ -145,18 +177,33 @@ async function directOpenAIChat(
   if (!key) {
     throw new Error("No OPENAI_API_KEY configured for direct fallback");
   }
-  const openRouter = isOpenRouterKey(key);
-  const endpoint = openRouter
-    ? "https://openrouter.ai/api/v1/chat/completions"
-    : "https://api.openai.com/v1/chat/completions";
+  const provider: DirectProvider = isOpenRouterKey(key)
+    ? "openrouter"
+    : isGroqKey(key)
+      ? "groq"
+      : "openai";
+  const endpoint =
+    provider === "groq"
+      ? "https://api.groq.com/openai/v1/chat/completions"
+      : provider === "openrouter"
+        ? "https://openrouter.ai/api/v1/chat/completions"
+        : "https://api.openai.com/v1/chat/completions";
 
   const buildBody = (tokenBudget?: number): Record<string, unknown> => {
     const effective = tokenBudget ?? maxTokens;
     const body: Record<string, unknown> = {
-      model: openRouter ? openRouterModelName(model) : model,
+      model:
+        provider === "groq"
+          ? groqModelName(model)
+          : provider === "openrouter"
+            ? openRouterModelName(model)
+            : model,
       messages,
     };
-    if (openRouter) {
+    if (provider === "groq") {
+      if (temperature !== undefined) body.temperature = temperature;
+      if (effective !== undefined) body.max_tokens = effective;
+    } else if (provider === "openrouter") {
       if (effective !== undefined) body.max_tokens = effective;
       if (!isReasoningModel(model) && temperature !== undefined) {
         body.temperature = temperature;
@@ -182,13 +229,15 @@ async function directOpenAIChat(
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${key}`,
-        ...(openRouter && { "X-Title": "Lumen Tutor" }),
+        ...(provider === "openrouter" && { "X-Title": "Lumen Tutor" }),
       },
       body: JSON.stringify(body),
     });
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      if (res.status === 401) throw new Error(friendlyAuthError(openRouter));
+      if (res.status === 401) {
+        throw new Error(friendlyAuthError(provider));
+      }
       throw new AIHttpError(res.status, text);
     }
     const data = (await res.json()) as {
@@ -210,6 +259,7 @@ async function directOpenAIChat(
     return await post(buildBody());
   } catch (err) {
     const isLowCredits =
+      provider === "openrouter" &&
       err instanceof AIHttpError &&
       (err.status === 402 ||
         (err.status === 400 && /insufficient|credits/i.test(err.body)));
@@ -221,10 +271,10 @@ async function directOpenAIChat(
       try {
         return await post(buildBody(affordable));
       } catch {
-        throw new Error(outOfCreditsError());
+        throw new Error(outOfCreditsError(provider));
       }
     }
-    throw new Error(outOfCreditsError());
+    throw new Error(outOfCreditsError(provider));
   }
 }
 
@@ -399,9 +449,9 @@ export async function embedTexts(texts: string[]): Promise<number[][]> {
   if (!key) {
     throw new EmbeddingsNotConfiguredError();
   }
-  if (isOpenRouterKey(key)) {
+  if (isOpenRouterKey(key) || isGroqKey(key)) {
     throw new EmbeddingsNotConfiguredError(
-      "Embeddings require a real OpenAI key — OpenRouter keys don't support the embeddings API. Keyword search is used instead.",
+      "Embeddings require a real OpenAI key — this provider doesn't support the embeddings API. Keyword search is used instead.",
     );
   }
   if (texts.length === 0) return [];
