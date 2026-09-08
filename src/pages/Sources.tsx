@@ -27,6 +27,7 @@ import {
   Loader2,
   Plus,
   Presentation,
+  RotateCcw,
   Sparkles,
   Trash2,
   UploadCloud,
@@ -97,6 +98,10 @@ function StatusBadge({ source }: { source: SourceDoc }) {
   }
 }
 
+// A source stuck in queued/processing for over 10 minutes is treated as
+// retryable — its pipeline run most likely died.
+const STUCK_AFTER_MS = 10 * 60 * 1000;
+
 // ---------------------------------------------------------------------------
 // Source card
 // ---------------------------------------------------------------------------
@@ -105,12 +110,17 @@ function SourceCard({
   source,
   collections,
   onDelete,
+  onRetry,
 }: {
   source: SourceDoc;
   collections: CollectionDoc[];
   onDelete: (id: Id<"sources">) => void;
+  onRetry: (id: Id<"sources">) => void;
 }) {
   const updateMeta = useMutation(api.sources.updateSourceMeta);
+  const stuck =
+    (source.status === "processing" || source.status === "queued") &&
+    Date.now() - source.updatedAt > STUCK_AFTER_MS;
 
   return (
     <div className="flex flex-col rounded-xl border bg-card p-4 shadow-sm transition-shadow hover:shadow-md">
@@ -145,7 +155,23 @@ function SourceCard({
             semantic search
           </Badge>
         )}
+        {(source.status === "failed" || stuck) && (
+          <button
+            type="button"
+            onClick={() => onRetry(source._id)}
+            className="ml-auto inline-flex items-center gap-1 rounded-full border border-primary/30 bg-primary/5 px-2.5 py-1 text-[11px] font-medium text-primary transition-colors hover:bg-primary/10"
+          >
+            <RotateCcw className="size-3" />
+            Retry
+          </button>
+        )}
       </div>
+
+      {stuck && source.status !== "failed" && (
+        <p className="mt-2 rounded-lg bg-amber-500/10 p-2 text-xs leading-5 text-amber-700 dark:text-amber-400">
+          This has been processing for a while — try again to re-run it.
+        </p>
+      )}
 
       {source.status === "failed" && source.error && (
         <p className="mt-2 rounded-lg bg-destructive/10 p-2 text-xs leading-5 text-destructive">
@@ -207,6 +233,7 @@ export default function Sources() {
   const generateUploadUrl = useMutation(api.sources.generateUploadUrl);
   const createSource = useMutation(api.sources.createSource);
   const deleteSource = useAction(api.sources.deleteSource);
+  const retrySource = useMutation(api.sources.retrySource);
   const createCollection = useMutation(api.sources.createCollection);
   const deleteCollection = useMutation(api.sources.deleteCollection);
 
@@ -276,6 +303,17 @@ export default function Sources() {
       toast.success("Source deleted.");
     } catch {
       toast.error("Couldn't delete that source.");
+    }
+  };
+
+  const handleRetrySource = async (id: Id<"sources">) => {
+    try {
+      await retrySource({ sourceId: id });
+      toast.success("Re-processing that source now.");
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : "Couldn't retry that source.",
+      );
     }
   };
 
@@ -386,7 +424,7 @@ export default function Sources() {
             {uploading > 0 ? "Uploading…" : "Drop files here or click to upload"}
           </p>
           <p className="mt-1 text-xs text-muted-foreground">
-            PDF, Word, PowerPoint, TXT or MD — up to 300 pages each
+            PDF, Word, PowerPoint, TXT or MD — up to 600 pages each
           </p>
         </div>
 
@@ -454,6 +492,7 @@ export default function Sources() {
                 source={s}
                 collections={collections ?? []}
                 onDelete={(id) => void handleDeleteSource(id)}
+                onRetry={(id) => void handleRetrySource(id)}
               />
             ))}
           </div>
