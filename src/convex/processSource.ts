@@ -13,6 +13,7 @@ import {
   resolveGeminiStoreName,
   uploadToGeminiStore,
 } from "./lib/gemini";
+import { LARGE_PAGE_COUNT } from "./lib/limits";
 
 // Internal source-processing pipeline (scheduled from `createSource` and
 // `retrySource`). Lives in its own module so `sources.ts` can reference these
@@ -79,6 +80,14 @@ export const processSource = internalAction({
         userId: args.userId,
         pageCount: pages.length,
       });
+
+      // A text-heavy book can be small on disk but still expensive to
+      // process — stamp the large-upload cooldown from page count too.
+      if (pages.length > LARGE_PAGE_COUNT) {
+        await ctx.runMutation(internal.processSource.stampLargeUpload, {
+          userId: args.userId,
+        });
+      }
 
       const chunks = chunkDocument({ ...extracted, pages }).slice(0, MAX_CHUNKS);
 
@@ -399,6 +408,27 @@ export const setGeminiDocName = internalMutation({
       geminiDocName: args.geminiDocName,
       updatedAt: Date.now(),
     });
+  },
+});
+
+/** Stamp the large-upload cooldown from page-count-based largeness. */
+export const stampLargeUpload = internalMutation({
+  args: { userId: v.id("users") },
+  handler: async (ctx, args) => {
+    const row = await ctx.db
+      .query("uploadCooldowns")
+      .withIndex("by_user", (q) => q.eq("userId", args.userId))
+      .first();
+    const now = Date.now();
+    if (row) {
+      await ctx.db.patch(row._id, { lastLargeUploadAt: now, updatedAt: now });
+    } else {
+      await ctx.db.insert("uploadCooldowns", {
+        userId: args.userId,
+        lastLargeUploadAt: now,
+        updatedAt: now,
+      });
+    }
   },
 });
 

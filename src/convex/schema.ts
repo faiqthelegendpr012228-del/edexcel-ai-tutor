@@ -108,6 +108,15 @@ const schema = defineSchema(
       .index("by_user", ["userId"])
       .index("by_user_status", ["userId", "status"]),
 
+    // Upload rate limiting. One row per student; tracks the last large-file
+    // upload so `createSource` can enforce the large-file cooldown and the
+    // Sources page can show the remaining time.
+    uploadCooldowns: defineTable({
+      userId: v.id("users"),
+      lastLargeUploadAt: v.optional(v.number()),
+      updatedAt: v.number(),
+    }).index("by_user", ["userId"]),
+
     // Chunks of extracted source text. Indexed for both semantic (vector)
     // and keyword (full-text) retrieval.
     chunks: defineTable({

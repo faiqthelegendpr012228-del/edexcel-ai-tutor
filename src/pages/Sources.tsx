@@ -21,6 +21,7 @@ import { api } from "@/convex/_generated/api";
 import type { Doc, Id } from "@/convex/_generated/dataModel";
 import { useAction, useMutation, useQuery } from "convex/react";
 import { QUALIFICATIONS } from "@/lib/curriculum";
+import { formatRemainingCooldown } from "@/lib/cooldown-format";
 import {
   AlertTriangle,
   FileText,
@@ -229,6 +230,15 @@ function SourceCard({
 export default function Sources() {
   const sources = useQuery(api.sources.listSources);
   const collections = useQuery(api.sources.listCollections);
+  // Per-student large-upload cooldown (ms remaining); refreshed every 30s so
+  // the hint counts down without manual refresh.
+  const cooldown = useQuery(api.sources.getCooldown);
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(timer);
+  }, []);
+  const cooldownRemainingMs = cooldown ? Math.max(0, cooldown.remainingMs - (Date.now() - now)) : 0;
   const aiStatus = useQuery(api.aiStatus.getStatus);
   const profile = useQuery(api.profiles.getMyProfile);
 
@@ -284,7 +294,7 @@ export default function Sources() {
           continue;
         }
         try {
-          const uploadUrl = await generateUploadUrl();
+          const uploadUrl = await generateUploadUrl({ size: file.size });
           const res = await fetch(uploadUrl, {
             method: "POST",
             body: file,
@@ -448,6 +458,13 @@ export default function Sources() {
           <p className="mt-1 text-xs text-muted-foreground">
             PDF, Word, PowerPoint, TXT or MD — up to 600 pages each
           </p>
+          {cooldownRemainingMs > 0 && (
+            <p className="mt-2 flex items-center gap-1.5 text-xs font-medium text-amber-600 dark:text-amber-400">
+              <AlertTriangle className="size-3.5" />
+              Large files (over 25 MB) are limited to one every 90 minutes —
+              next one in {formatRemainingCooldown(cooldownRemainingMs)}.
+            </p>
+          )}
         </div>
 
         {/* Subject tag for uploads — mirrors the dashboard's focus-subject

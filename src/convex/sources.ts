@@ -1,8 +1,14 @@
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { v, type GenericId } from "convex/values";
-import { action, mutation, query } from "./_generated/server";
+import { action, mutation, query, type MutationCtx } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { QUALIFICATIONS } from "../lib/curriculum";
+import {
+  LARGE_FILE_BYTES,
+  LARGE_COOLDOWN_MS,
+  largeUploadRemainingMs,
+  formatRemainingCooldown,
+} from "./lib/limits";
 
 type Id<T extends string> = GenericId<T>;
 
@@ -30,12 +36,59 @@ function validateSubject(subject: string): string {
 // Upload + source lifecycle
 // ---------------------------------------------------------------------------
 
+/**
+ * Upload-url gate: small files pass freely; a "large" file (> 25 MB, the
+ * scanned-textbook case we can detect before processing) requires the
+ * per-student cooldown window to have passed. Page-count-based large files
+ * (100+ text pages, small on disk) are stamped in processSource so the
+ * cooldown also covers them for the next upload.
+ */
 export const generateUploadUrl = mutation({
-  args: {},
-  handler: async (ctx) => {
+  args: { size: v.number() },
+  handler: async (ctx, args) => {
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) throw new Error("Not authenticated");
+
+    if (args.size > LARGE_FILE_BYTES) {
+      const row = await ctx.db
+        .query("uploadCooldowns")
+        .withIndex("by_user", (q) => q.eq("userId", userId))
+        .first();
+      const remaining = largeUploadRemainingMs(
+        row?.lastLargeUploadAt,
+        Date.now(),
+      );
+      if (remaining > 0) {
+        throw new Error(
+          `That file is large (over 25 MB). To keep processing fast for everyone, large uploads are limited to one every 90 minutes — try again in ${formatRemainingCooldown(remaining)}. Small files are unaffected.`,
+        );
+      }
+    }
+
     return await ctx.storage.generateUploadUrl();
   },
 });
+
+/** Stamp the cooldown when a large upload lands. */
+async function stampLargeUpload(
+  ctx: MutationCtx,
+  userId: Id<"users">,
+): Promise<void> {
+  const row = await ctx.db
+    .query("uploadCooldowns")
+    .withIndex("by_user", (q) => q.eq("userId", userId))
+    .first();
+  const now = Date.now();
+  if (row) {
+    await ctx.db.patch(row._id, { lastLargeUploadAt: now, updatedAt: now });
+  } else {
+    await ctx.db.insert("uploadCooldowns", {
+      userId,
+      lastLargeUploadAt: now,
+      updatedAt: now,
+    });
+  }
+}
 
 export const createSource = mutation({
   args: {
@@ -84,6 +137,11 @@ export const createSource = mutation({
       createdAt: now,
       updatedAt: now,
     });
+
+    // Large uploads start the cooldown window immediately.
+    if (args.size > LARGE_FILE_BYTES) {
+      await stampLargeUpload(ctx, userId);
+    }
 
     await ctx.scheduler.runAfter(0, internal.processSource.processSource, {
       sourceId,
@@ -187,6 +245,22 @@ export const listSources = query({
       .withIndex("by_user", (q) => q.eq("userId", userId))
       .order("desc")
       .collect();
+  },
+});
+
+/** Remaining large-upload cooldown (ms), for the Sources page hint. */
+export const getCooldown = query({
+  args: {},
+  handler: async (ctx) => {
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) return { remainingMs: 0 };
+    const row = await ctx.db
+      .query("uploadCooldowns")
+      .withIndex("by_user", (q) => q.eq("userId", userId))
+      .first();
+    return {
+      remainingMs: largeUploadRemainingMs(row?.lastLargeUploadAt, Date.now()),
+    };
   },
 });
 
