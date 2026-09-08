@@ -7,12 +7,15 @@ import { vly } from "../../lib/vly-integrations";
  *
  * - Chat: routed through the Freebuff/VLY AI gateway (zero configuration,
  *   billed automatically). Model routing can be tuned per call.
- * - Embeddings: OpenAI `text-embedding-3-small` via direct API. Requires the
- *   student/deployment to add an `OPENAI_API_KEY` in the Keys UI. When it is
- *   missing, the RAG pipeline gracefully falls back to keyword search.
- *
- * Later versions can swap in other providers (Anthropic, Google, local models)
- * behind these same function signatures.
+ * - Fallback chat: when the gateway rejects a request, we retry directly
+ *   against the key stored in OPENAI_API_KEY. That key may be a real OpenAI
+ *   key (api.openai.com) OR an OpenRouter key (`sk-or-v1…`, openrouter.ai) —
+ *   both speak the same chat-completions protocol, so both are supported and
+ *   routed to the right host automatically.
+ * - Embeddings: OpenAI `text-embedding-3-small` via direct API. Requires a
+ *   real OpenAI key (OpenRouter does not expose an embeddings endpoint).
+ *   When unavailable, the RAG pipeline gracefully falls back to keyword
+ *   search.
  */
 
 export const EMBEDDING_MODEL = "text-embedding-3-small";
@@ -28,14 +31,33 @@ export const MODELS = {
 } as const;
 
 export class EmbeddingsNotConfiguredError extends Error {
-  constructor() {
-    super("OPENAI_API_KEY is not configured");
+  constructor(reason?: string) {
+    super(
+      reason ??
+        "OPENAI_API_KEY is not configured",
+    );
     this.name = "EmbeddingsNotConfiguredError";
   }
 }
 
+/**
+ * OpenRouter keys start with `sk-or-` (e.g. `sk-or-v1-…`). They authenticate
+ * against openrouter.ai, not api.openai.com, and cannot be used for the
+ * embeddings API.
+ */
+export function isOpenRouterKey(key: string | undefined): boolean {
+  return !!key && key.startsWith("sk-or-");
+}
+
+/** OpenRouter model slugs are vendor-prefixed: `openai/gpt-4o-mini`. */
+function openRouterModelName(model: string): string {
+  return model.includes("/") ? model : `openai/${model}`;
+}
+
 export function hasEmbeddingsConfigured(): boolean {
-  return !!process.env.OPENAI_API_KEY;
+  const key = process.env.OPENAI_API_KEY;
+  // OpenRouter keys can't call the embeddings endpoint.
+  return !!key && !isOpenRouterKey(key);
 }
 
 export interface ChatMessage {
@@ -54,10 +76,11 @@ export interface ChatResult {
  * sampling temperature. Sending a custom value makes the gateway reject the
  * request and the stream dies before producing any output — which surfaces to
  * students as "No output generated. Check the stream for errors." So for
- * these models the temperature must be omitted entirely.
+ * these models the temperature must be omitted entirely. The vendor prefix
+ * used by OpenRouter (`openai/gpt-5`) is tolerated here.
  */
 function isReasoningModel(model: string): boolean {
-  return /^(gpt-5|o[134])/i.test(model);
+  return /^(?:[a-z0-9-]+\/)?(gpt-5|o[134])/i.test(model);
 }
 
 function temperatureFor(model: string, requested?: number): number | undefined {
@@ -66,12 +89,15 @@ function temperatureFor(model: string, requested?: number): number | undefined {
 }
 
 /**
- * Direct OpenAI chat completion. Used as a reliability fallback when the VLY
- * gateway rejects the request (e.g. gateway-side key/auth hiccups) so the
- * product keeps working with the student's own OPENAI_API_KEY.
+ * Direct chat completion against the key in OPENAI_API_KEY. Used as a
+ * reliability fallback when the VLY gateway rejects the request so the
+ * product keeps working with the student's own key.
  *
- * Reasoning-style models need `max_completion_tokens` and no custom
- * temperature; standard models take `max_tokens` + `temperature`.
+ * - Real OpenAI key → api.openai.com. Reasoning-style models need
+ *   `max_completion_tokens` and no custom temperature; standard models take
+ *   `max_tokens` + `temperature`.
+ * - OpenRouter key (`sk-or-…`) → openrouter.ai with vendor-prefixed model
+ *   slugs and `max_tokens`.
  */
 async function directOpenAIChat(
   messages: ChatMessage[],
@@ -83,25 +109,49 @@ async function directOpenAIChat(
   if (!key) {
     throw new Error("No OPENAI_API_KEY configured for direct fallback");
   }
-  const body: Record<string, unknown> = { model, messages };
-  if (isReasoningModel(model)) {
+  const openRouter = isOpenRouterKey(key);
+
+  const body: Record<string, unknown> = {
+    model: openRouter ? openRouterModelName(model) : model,
+    messages,
+  };
+  if (openRouter) {
+    if (maxTokens !== undefined) body.max_tokens = maxTokens;
+    if (!isReasoningModel(model) && temperature !== undefined) {
+      body.temperature = temperature;
+    }
+  } else if (isReasoningModel(model)) {
     if (maxTokens !== undefined) body.max_completion_tokens = maxTokens;
   } else {
     if (temperature !== undefined) body.temperature = temperature;
     if (maxTokens !== undefined) body.max_tokens = maxTokens;
   }
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${key}`,
+
+  const res = await fetch(
+    openRouter
+      ? "https://openrouter.ai/api/v1/chat/completions"
+      : "https://api.openai.com/v1/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${key}`,
+        ...(openRouter && { "X-Title": "Lumen Tutor" }),
+      },
+      body: JSON.stringify(body),
     },
-    body: JSON.stringify(body),
-  });
+  );
   if (!res.ok) {
     const text = await res.text().catch(() => "");
+    if (res.status === 401) {
+      throw new Error(
+        openRouter
+          ? "Your OpenRouter key was rejected (401). Check OPENAI_API_KEY in the Keys panel — it must be a valid `sk-or-…` key with credit available."
+          : "Your OPENAI_API_KEY was rejected (401 invalid_api_key). Check it in the Keys panel — it must be a real OpenAI key starting with `sk-`, not an OpenRouter key (`sk-or-…`).",
+      );
+    }
     throw new Error(
-      `OpenAI request failed (${res.status}): ${text.slice(0, 300)}`,
+      `AI request failed (${res.status}): ${text.slice(0, 300)}`,
     );
   }
   const data = (await res.json()) as {
@@ -199,9 +249,9 @@ export async function streamChatCompletion(
     }
   }
 
-  // 3) Direct-OpenAI fallback: the gateway is rejecting the key but the
-  //    student's own OPENAI_API_KEY still works. Simulate streaming so the
-  //    UI behaves exactly as before.
+  // 3) Direct fallback: the gateway is rejecting the key but the student's
+  //    own OPENAI_API_KEY (OpenAI or OpenRouter) still works. Simulate
+  //    streaming so the UI behaves exactly as before.
   if (process.env.OPENAI_API_KEY) {
     for (const attemptModel of attempts) {
       try {
@@ -259,7 +309,7 @@ export async function chatCompletion(
     }
   }
 
-  // Direct-OpenAI fallback when the gateway rejects the key entirely.
+  // Direct fallback when the gateway rejects the key entirely.
   if (process.env.OPENAI_API_KEY) {
     const attempts: string[] = [model];
     if (MODELS.fallback !== model) attempts.push(MODELS.fallback);
@@ -282,12 +332,18 @@ export async function chatCompletion(
 
 /**
  * Embed a batch of texts. Returns one vector per input, in the same order.
- * Throws EmbeddingsNotConfiguredError when OPENAI_API_KEY is absent.
+ * Throws EmbeddingsNotConfiguredError when no usable OpenAI key is present
+ * (OpenRouter keys don't support the embeddings API).
  */
 export async function embedTexts(texts: string[]): Promise<number[][]> {
   const key = process.env.OPENAI_API_KEY;
   if (!key) {
     throw new EmbeddingsNotConfiguredError();
+  }
+  if (isOpenRouterKey(key)) {
+    throw new EmbeddingsNotConfiguredError(
+      "Embeddings require a real OpenAI key — OpenRouter keys don't support the embeddings API. Keyword search is used instead.",
+    );
   }
   if (texts.length === 0) return [];
 
