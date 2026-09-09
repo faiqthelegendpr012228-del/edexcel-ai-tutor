@@ -14,6 +14,10 @@ import {
   hasGeminiKey,
   resolveGeminiStoreName,
 } from "./lib/gemini";
+import {
+  decideGrounding,
+  formatResetIn,
+} from "./lib/limits";
 
 type Id<T extends string> = GenericId<T>;
 
@@ -330,10 +334,40 @@ export const askTutor = action({
 
     const sourcesMode = chat.sourceMode && !allowOutside;
 
-    let contextChunks: RetrievedChunk[] = [];
-    const mode: "sources" | "outside" = sourcesMode ? "sources" : "outside";
+    // Retrieval gating: only turns that genuinely need sources spend a File
+    // Search query. Conservative — anything not clearly conversational is
+    // grounded. The decision is stored on the message for transparency, and
+    // the UI offers a "Check my sources" re-ground action either way.
+    const priorMessages = await ctx.runQuery(internal.chatsInternal._getMessages, {
+      chatId: args.chatId,
+    });
+    const hasPriorAssistantTurn = priorMessages.some(
+      (m) => m.role === "assistant" && m.content.trim().length > 0,
+    );
+    const gating = allowOutside
+      ? ({ ground: false, reason: "outside" } as const)
+      : decideGrounding({ userMessage: content, hasPriorAssistantTurn });
 
-    if (sourcesMode) {
+    // Quota only gates turns that would otherwise be grounded. When it's out,
+    // the student still gets an answer — ungrounded, clearly labelled.
+    let quotaNote: string | undefined;
+    if (sourcesMode && gating.ground) {
+      const quota = await ctx.runQuery(internal.chatsInternal._getQuotaStatus, {
+        userId,
+      });
+      if (quota.used >= quota.limit) {
+        const resetIn = formatResetIn(quota.resetsInMs);
+        quotaNote = `You've used all ${quota.limit} source-checked answers for this week — they reset in ${resetIn}. Here's the best answer I can give without checking your sources this time.`;
+      }
+    }
+
+    const skipRetrieval = !!quotaNote || !gating.ground;
+    const groundedThisTurn = sourcesMode && !skipRetrieval;
+
+    let contextChunks: RetrievedChunk[] = [];
+    const mode: "sources" | "outside" = groundedThisTurn ? "sources" : "outside";
+
+    if (sourcesMode && !skipRetrieval) {
       // Which sources are allowed for this chat? Explicit selection wins;
       // empty selection means all of the student's ready sources.
       let allowedSourceIds: Array<Id<"sources">>;
@@ -383,10 +417,9 @@ export const askTutor = action({
       }
     }
 
-    // Build the LLM conversation.
-    const history = await ctx.runQuery(internal.chatsInternal._getMessages, {
-      chatId: args.chatId,
-    });
+    // Build the LLM conversation. (priorMessages already includes everything
+    // up to the just-inserted user message.)
+    const history = priorMessages;
 
     // Resolve source names for the context block.
     let sourceNames = new Map<Id<"sources">, string>();
@@ -403,8 +436,8 @@ export const askTutor = action({
         content: buildSystemPrompt({
           qualification: chat.qualification,
           subject: chat.subject,
-          sourcesMode,
-          context: sourcesMode
+          sourcesMode: groundedThisTurn,
+          context: groundedThisTurn
             ? contextChunks.map((c) => ({
                 content: c.content,
                 sourceName: sourceNames.get(c.sourceId) ?? "Uploaded source",
@@ -444,9 +477,11 @@ export const askTutor = action({
       }> = [];
       let needsPermission = false;
 
-      // Primary path: Gemini File Search. Gemini retrieves from the Edexcel
-      // knowledge base automatically and returns document citations.
-      if (hasGeminiKey()) {
+      // Primary path: Gemini File Search — only for turns that genuinely
+      // need grounding (retrieval gating). Everything else (acknowledgments,
+      // follow-ups, quota-gated turns, outside-knowledge mode) uses the
+      // general chain and does not spend a File Search query.
+      if (hasGeminiKey() && groundedThisTurn) {
         try {
           const storeName = await resolveGeminiStoreName();
           // Scope retrieval to the active subject and this student's own
@@ -490,6 +525,15 @@ export const askTutor = action({
             snippet: c.snippet,
           }));
           needsPermission = false;
+          // Log the grounded query: rolling-window quota + monthly usage.
+          await ctx.runMutation(internal.chatsInternal._recordAiUsage, {
+            userId,
+            subject: chat.subject,
+          });
+          await ctx.runMutation(internal.usage._recordMonthly, {
+            userId,
+            subject: chat.subject,
+          });
         } catch (gemErr) {
           const msg =
             gemErr instanceof Error ? gemErr.message : String(gemErr);
@@ -550,10 +594,12 @@ export const askTutor = action({
 
       await ctx.runMutation(internal.chatsInternal._finalizeMessage, {
         messageId: msgId,
-        content: finalContent,
+        content: quotaNote ? `${quotaNote}\n\n${finalContent}` : finalContent,
         citations: citations.length > 0 ? citations : undefined,
         mode,
         needsPermission: needsPermission || undefined,
+        grounded: groundedThisTurn,
+        groundingReason: quotaNote ? "quota" : gating.reason,
       });
 
       return { needsPermission: !!needsPermission, messageId: msgId };

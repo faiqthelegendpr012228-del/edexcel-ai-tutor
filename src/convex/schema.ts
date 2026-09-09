@@ -108,6 +108,28 @@ const schema = defineSchema(
       .index("by_user", ["userId"])
       .index("by_user_status", ["userId", "status"]),
 
+    // One row per grounded File Search query, for per-student usage logging
+    // and quota enforcement. `windowStart` is the start of the rolling
+    // QUOTA_WINDOW_DAYS window the query counted against.
+    aiUsage: defineTable({
+      userId: v.id("users"),
+      usedAt: v.number(),
+      windowStart: v.number(),
+      subject: v.optional(v.string()),
+    }).index("by_user_window", ["userId", "windowStart"]),
+
+    // Monthly aggregate of grounded queries per student (plus one platform-
+    // wide row with userId undefined). The real-usage data used to revisit
+    // the quota constants later.
+    aiUsageMonthly: defineTable({
+      userId: v.optional(v.id("users")),
+      month: v.string(), // YYYY-MM
+      groundedQueries: v.number(),
+      updatedAt: v.number(),
+    })
+      .index("by_user_month", ["userId", "month"])
+      .index("by_month", ["month"]),
+
     // Upload rate limiting. One row per student; tracks the last large-file
     // upload so `createSource` can enforce the large-file cooldown and the
     // Sources page can show the remaining time.
@@ -263,6 +285,13 @@ const schema = defineSchema(
       // True when the answer could not be grounded in the selected sources,
       // and the UI should offer an "Allow outside knowledge" action.
       needsPermission: v.optional(v.boolean()),
+      // Transparency flag: true when this answer was actually grounded in
+      // retrieved source material (Gemini File Search or local RAG chunks).
+      // False/null = answered from general knowledge without a source search.
+      grounded: v.optional(v.boolean()),
+      // Why grounding happened or was skipped ("needed", "acknowledgment",
+      // "followup", "forced", "outside", "empty").
+      groundingReason: v.optional(v.string()),
       createdAt: v.number(),
     })
       .index("by_chat", ["chatId"])

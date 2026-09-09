@@ -1,5 +1,9 @@
 import { v, type GenericId } from "convex/values";
 import { internalMutation, internalQuery } from "./_generated/server";
+import {
+  QUOTA_WINDOW_DAYS,
+  TUTOR_GROUNDED_QUOTA_PER_WEEK,
+} from "./lib/limits";
 
 type Id<T extends string> = GenericId<T>;
 
@@ -138,6 +142,8 @@ export const _finalizeMessage = internalMutation({
     ),
     mode: v.optional(v.union(v.literal("sources"), v.literal("outside"))),
     needsPermission: v.optional(v.boolean()),
+    grounded: v.optional(v.boolean()),
+    groundingReason: v.optional(v.string()),
     error: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
@@ -151,8 +157,70 @@ export const _finalizeMessage = internalMutation({
       ...(args.needsPermission !== undefined && {
         needsPermission: args.needsPermission,
       }),
+      ...(args.grounded !== undefined && { grounded: args.grounded }),
+      ...(args.groundingReason !== undefined && {
+        groundingReason: args.groundingReason,
+      }),
       ...(args.error !== undefined && { error: args.error }),
     });
+  },
+});
+
+// ---------------------------------------------------------------------------
+// Grounded-query quota (File Search is the scarce free-tier resource)
+// ---------------------------------------------------------------------------
+
+const QUOTA_WINDOW_MS = QUOTA_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+
+/** Log one grounded File Search query against the rolling window. */
+export const _recordAiUsage = internalMutation({
+  args: {
+    userId: v.id("users"),
+    subject: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const now = Date.now();
+    await ctx.db.insert("aiUsage", {
+      userId: args.userId,
+      usedAt: now,
+      windowStart: now - QUOTA_WINDOW_MS,
+      subject: args.subject,
+    });
+  },
+});
+
+/**
+ * Quota status for one student over the rolling window. Rows older than the
+ * window are pruned opportunistically so the index stays small without a cron.
+ */
+export const _getQuotaStatus = internalQuery({
+  args: { userId: v.id("users") },
+  handler: async (ctx, args) => {
+    const now = Date.now();
+    const windowStart = now - QUOTA_WINDOW_MS;
+    const rows = await ctx.db
+      .query("aiUsage")
+      .withIndex("by_user_window", (q) =>
+        q.eq("userId", args.userId).gte("windowStart", windowStart),
+      )
+      .collect();
+
+    const inWindow = rows.filter((r) => r.usedAt > windowStart);
+    // Opportunistic cleanup of stale rows.
+    for (const row of rows) {
+      if (row.usedAt <= windowStart) await ctx.db.delete(row._id);
+    }
+
+    const used = inWindow.length;
+    const oldest = inWindow.reduce<number | null>(
+      (acc, r) => (acc === null || r.usedAt < acc ? r.usedAt : acc),
+      null,
+    );
+    const resetsInMs =
+      used >= TUTOR_GROUNDED_QUOTA_PER_WEEK && oldest !== null
+        ? Math.max(0, oldest + QUOTA_WINDOW_MS - now)
+        : 0;
+    return { used, limit: TUTOR_GROUNDED_QUOTA_PER_WEEK, resetsInMs };
   },
 });
 
