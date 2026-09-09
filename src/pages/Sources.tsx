@@ -171,11 +171,14 @@ function SourceCard({
 
       {stuck && source.status !== "failed" && (
         <p className="mt-2 rounded-lg bg-amber-500/10 p-2 text-xs leading-5 text-amber-700 dark:text-amber-400">
-          This has been processing for a while — try again to re-run it.
+          This has been processing for longer than expected — hit Retry to
+          re-run it. Nothing was lost; it picks up from the same file.
         </p>
       )}
 
-      {source.status === "failed" && source.error && (
+      {source.status === "failed" &&
+        source.error &&
+        source.error.trim() && (
         <p className="mt-2 rounded-lg bg-destructive/10 p-2 text-xs leading-5 text-destructive">
           {source.error}
         </p>
@@ -407,8 +410,9 @@ export default function Sources() {
                   <strong className="text-foreground">
                     Keyword search only.
                   </strong>{" "}
-                  Add an <code>OPENAI_API_KEY</code> to enable semantic
-                  retrieval — sources still work with exact keyword matching.
+                  Add a <code>GEMINI_API_KEY</code> in the Keys panel to enable
+                  semantic retrieval — sources still work with exact keyword
+                  matching.
                 </span>
               </>
             )}

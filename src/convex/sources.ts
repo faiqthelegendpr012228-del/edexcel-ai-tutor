@@ -143,7 +143,7 @@ export const createSource = mutation({
       await stampLargeUpload(ctx, userId);
     }
 
-    await ctx.scheduler.runAfter(0, internal.processSource.processSource, {
+    await ctx.scheduler.runAfter(0, internal.processSourceActions.processSource, {
       sourceId,
       userId,
       storageId: args.storageId,
@@ -152,7 +152,7 @@ export const createSource = mutation({
 
     // Mirror the file into the Gemini File Search Store (when configured) so
     // tutor answers can ground against it, scoped by subject metadata.
-    await ctx.scheduler.runAfter(0, internal.processSource.uploadToGemini, {
+    await ctx.scheduler.runAfter(0, internal.processSourceActions.uploadToGemini, {
       sourceId,
       userId,
       storageId: args.storageId,
@@ -181,7 +181,7 @@ export const retrySource = mutation({
       updatedAt: Date.now(),
     });
 
-    await ctx.scheduler.runAfter(0, internal.processSource.processSource, {
+    await ctx.scheduler.runAfter(0, internal.processSourceActions.processSource, {
       sourceId: args.sourceId,
       userId,
       storageId: source.storageId,
@@ -190,7 +190,7 @@ export const retrySource = mutation({
 
     // Retry the Gemini mirror too — the action no-ops when the key is
     // missing or the document is already indexed.
-    await ctx.scheduler.runAfter(0, internal.processSource.uploadToGemini, {
+    await ctx.scheduler.runAfter(0, internal.processSourceActions.uploadToGemini, {
       sourceId: args.sourceId,
       userId,
       storageId: source.storageId,
