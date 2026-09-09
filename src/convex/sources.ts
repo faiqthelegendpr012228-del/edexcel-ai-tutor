@@ -210,6 +210,35 @@ export const retrySource = mutation({
 });
 
 /**
+ * Find the real error (if any) a scheduled processing run recorded for this
+ * source. `_scheduled_functions` is the API mirror of the dashboard's
+ * function log, so we can surface the actual failure (OOM, timeout, …) on
+ * the source row instead of a generic "interrupted" message. Returns null
+ * when no failed invocation was found.
+ */
+async function lastInvocationError(
+  ctx: MutationCtx,
+  sourceId: string,
+): Promise<string | null> {
+  const rows = await ctx.db.system
+    .query("_scheduled_functions")
+    .order("desc")
+    .take(200);
+  for (const row of rows) {
+    if (!row.name.includes("processSourceActions")) continue;
+    const arg = (row.args as unknown[] | undefined)?.[0] as
+      | { sourceId?: unknown }
+      | undefined;
+    if (arg?.sourceId !== sourceId) continue;
+    const state = row.state as { kind?: string; error?: string };
+    if (state?.kind === "failed") {
+      return state.error?.split("\n")[0].slice(0, 220) ?? "Unknown action failure";
+    }
+  }
+  return null;
+}
+
+/**
  * Watchdog (runs every 5 min from crons.ts): a source whose processing
  * action died mid-run would hang in queued/processing forever — no catch
  * block runs when the action itself is killed.
@@ -223,6 +252,10 @@ export const retrySource = mutation({
  *    keeping the last-known stage so the card shows where it stopped.
  *    Re-running automatically could overlap real partial work, so these
  *    stay manual (Retry) on purpose.
+ *
+ * Both failure paths record the REAL error from the invocation log when one
+ * exists (e.g. the 512MB Node memory limit), so students and operators see
+ * the actual cause instead of a vague interruption notice.
  */
 export const failStaleProcessingSources = internalMutation({
   args: {},
@@ -243,10 +276,15 @@ export const failStaleProcessingSources = internalMutation({
       .collect();
 
     for (const source of stale) {
+      const realError = await lastInvocationError(ctx, source._id);
+      const message = realError
+        ? /out of memory|512 MB/i.test(realError)
+          ? "This file is too large to process in one pass — the server ran out of memory (a hard 512 MB limit per job). Split it into smaller files (e.g. by unit or chapter) and upload them separately: same content, and every other feature works."
+          : `Processing failed inside the run: ${realError} — hit Retry to try again.`
+        : "Processing didn't complete (the run was interrupted). Nothing was lost — hit Retry to re-run it from the same file.";
       await ctx.db.patch(source._id, {
         status: "failed",
-        error:
-          "Processing didn't complete (the run was interrupted). Nothing was lost — hit Retry to re-run it from the same file.",
+        error: message,
         updatedAt: Date.now(),
       });
     }
@@ -254,10 +292,12 @@ export const failStaleProcessingSources = internalMutation({
     for (const source of staleQueued) {
       // Already re-scheduled once and it STILL never started: stop trying.
       if (source.requeuedAt !== undefined) {
+        const realError = await lastInvocationError(ctx, source._id);
         await ctx.db.patch(source._id, {
           status: "failed",
-          error:
-            "Processing never started after an automatic retry. Hit Retry to try again from the same file.",
+          error: realError
+            ? `Processing never started: ${realError} — hit Retry to try again.`
+            : "Processing never started after an automatic retry. Hit Retry to try again from the same file.",
           updatedAt: Date.now(),
         });
         continue;

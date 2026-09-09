@@ -64,25 +64,21 @@ export const processSource = internalAction({
     });
 
     try {
-      const file = await ctx.storage.get(args.storageId);
-      if (file === null) {
-        await fail("The uploaded file could not be found in storage.");
-        return;
-      }
-      const bytes = await file.arrayBuffer();
-
-      // -----------------------------------------------------------------
-      // Stage: extracting. PDFs parse page by page, so report real
-      // progress ("212/430") as each parallel slice completes. Writes are
-      // throttled and fire-and-forget: they must never slow or break the
-      // pipeline itself. Each write also refreshes updatedAt, which is the
-      // liveness signal the stuck-source watchdog reads.
-      // -----------------------------------------------------------------
+      // Stage is written BEFORE the file is loaded: pulling a 150MB blob into
+      // memory is the first memory-heavy step (OOM here used to leave the row
+      // stuck on the initial "queued" stage with no diagnosis).
       await ctx.runMutation(internal.processSource.markSourceStage, {
         sourceId: args.sourceId,
         userId: args.userId,
         stage: "extracting",
       });
+      // -------------------------------------------------------------
+      // Stage: extracting. PDFs parse page by page, so report real
+      // progress ("212/430") as each parallel slice completes. Writes are
+      // throttled and fire-and-forget: they must never slow or break the
+      // pipeline itself. Each write also refreshes updatedAt, which is the
+      // liveness signal the stuck-source watchdog reads.
+      // -------------------------------------------------------------
       let lastProgressWrite = 0;
       let progressWrite: Promise<unknown> = Promise.resolve();
       const reportProgress = (done: number, total: number) => {
@@ -101,13 +97,26 @@ export const processSource = internalAction({
           .catch(() => undefined);
       };
 
-      // Parallel page extraction inside extractText (PDF pages are pulled in
-      // slices of PDF_EXTRACT_CONCURRENCY).
-      const extracted = await extractText(args.type, bytes, {
-        pageConcurrency: PDF_EXTRACT_CONCURRENCY,
-        onProgress: reportProgress,
-      });
+      const extracted = await (async () => {
+        const file = await ctx.storage.get(args.storageId);
+        if (file === null) return null;
+        const bytes = await file.arrayBuffer();
+        // Node actions get a hard 512MB. The raw bytes already sit in memory,
+        // so parallel page parsing multiplies on top of that — big files get
+        // a lower slice size to keep the pdf.js working set bounded.
+        const pageConcurrency =
+          bytes.byteLength > 50 * 1024 * 1024 ? 3 : PDF_EXTRACT_CONCURRENCY;
+        return await extractText(args.type, bytes, {
+          pageConcurrency,
+          onProgress: reportProgress,
+        });
+      })();
       await progressWrite.catch(() => undefined);
+
+      if (extracted === null) {
+        await fail("The uploaded file could not be found in storage.");
+        return;
+      }
       const pages = extracted.pages.slice(0, MAX_PAGES_PROCESSED);
       const text = normalizeExtractedText(extracted.text);
       if (!text) {
@@ -348,12 +357,12 @@ export const uploadToGemini = internalAction({
       const storeName = await resolveGeminiStoreName();
       const file = await ctx.storage.get(args.storageId);
       if (!file) return;
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      const mimeType = geminiMimeForType(source.type);
+      // Pass the storage blob straight through (wrapped to attach the mime
+      // type) — no full-file copy in memory.
+      const blob = new Blob([file], { type: geminiMimeForType(source.type) });
       const docName = await uploadToGeminiStore({
         storeName,
-        bytes,
-        mimeType,
+        file: blob,
         displayName: source.name,
         ownerUserId: args.userId,
         subject: source.subject,

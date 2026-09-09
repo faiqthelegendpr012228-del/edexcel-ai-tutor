@@ -204,8 +204,10 @@ export async function geminiFileSearchStream(
 export async function uploadToGeminiStore(
   opts: {
     storeName: string;
-    bytes: Uint8Array;
-    mimeType: string;
+    // The file blob is passed straight through to the SDK. undici (Node's
+    // blob implementation) stores nested Blob parts by reference, so this
+    // never materializes a second copy of a 150MB file in the 512MB action.
+    file: Blob;
     displayName: string;
     ownerUserId: string;
     subject?: string;
@@ -213,9 +215,7 @@ export async function uploadToGeminiStore(
 ): Promise<string> {
   const ai = getGeminiClient();
   const operation = await ai.fileSearchStores.uploadToFileSearchStore({
-    file: new Blob([opts.bytes.buffer as ArrayBuffer], {
-      type: opts.mimeType,
-    }),
+    file: opts.file,
     fileSearchStoreName: opts.storeName,
     config: {
       displayName: opts.displayName,
