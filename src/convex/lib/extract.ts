@@ -127,16 +127,41 @@ interface PdfDocument {
   destroy(): Promise<void>;
 }
 
+interface PdfjsModule {
+  getDocument(params: { data: Uint8Array }): {
+    promise: Promise<PdfDocument>;
+  };
+}
+
 // Returns the pdfjs-dist legacy build (2.x — the latest pdf.js releases use
 // `structuredClone` transfers the Convex runtime rejects, so we pin the
-// proven legacy line). Typed structurally to match the module's runtime shape.
-async function importPdfjs(): Promise<{
-  getDocument(params: { data: Uint8Array }): { promise: Promise<PdfDocument> };
-}> {
-  const mod = await import("pdfjs-dist/legacy/build/pdf.js");
-  return mod as unknown as {
-    getDocument(params: { data: Uint8Array }): { promise: Promise<PdfDocument> };
+// proven legacy line).
+//
+// The package ships a UMD/CJS bundle. Under bundlers (tsx, vite) interop
+// unwraps it, but the Convex Node runtime hands actions the raw namespace,
+// where the API lives under `.default` — calling `mod.getDocument` directly
+// threw "(intermediate value).getDocument is not a function". Handle both
+// shapes and fail loudly here if neither matches, instead of a cryptic
+// TypeError mid-extraction.
+async function importPdfjs(): Promise<PdfjsModule> {
+  const mod = (await import("pdfjs-dist/legacy/build/pdf.js")) as unknown as {
+    getDocument?: unknown;
+    default?: { getDocument?: unknown } | undefined;
   };
+  const candidates: Array<{ getDocument?: unknown } | undefined> = [
+    mod,
+    mod.default,
+  ];
+  const impl = candidates.find(
+    (c): c is PdfjsModule =>
+      !!c && typeof c.getDocument === "function",
+  );
+  if (!impl) {
+    throw new Error(
+      "The PDF engine failed to load (unexpected pdfjs-dist module shape). Hit Retry — if this keeps happening, the pdfjs-dist version needs checking.",
+    );
+  }
+  return impl;
 }
 
 async function extractDocx(buffer: Buffer): Promise<ExtractedDocument> {
