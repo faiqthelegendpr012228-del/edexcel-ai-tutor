@@ -119,6 +119,10 @@ const schema = defineSchema(
       // on their next process/retry so semantic search never mixes vector
       // spaces.
       embeddingModel: v.optional(v.string()),
+      // Set by the watchdog when it re-schedules a source whose queued action
+      // never started (Convex runs actions at most once). Guarantees at most
+      // one automatic requeue — a second miss flips the source to failed.
+      requeuedAt: v.optional(v.number()),
       error: v.optional(v.string()),
       // Resource name of the document inside the Gemini File Search Store
       // (e.g. fileSearchStores/…/documents/xyz). Set once the upload/index

@@ -130,7 +130,7 @@ const STAGE_LABEL: Record<string, string> = {
 };
 
 const STAGE_HINT: Record<string, string> = {
-  queued: "Waiting for a processing slot…",
+  queued: "Starting up…",
   extracting: "Reading the file page by page",
   chunking: "Splitting text into citable passages",
   embedding: "Building semantic search vectors",

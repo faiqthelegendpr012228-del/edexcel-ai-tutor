@@ -187,6 +187,8 @@ export const retrySource = mutation({
       stage: "queued",
       stageDetail: undefined,
       error: undefined,
+      // Fresh manual run: restore the one-shot automatic requeue budget.
+      requeuedAt: undefined,
       updatedAt: Date.now(),
     });
 
@@ -210,8 +212,17 @@ export const retrySource = mutation({
 /**
  * Watchdog (runs every 5 min from crons.ts): a source whose processing
  * action died mid-run would hang in queued/processing forever — no catch
- * block runs when the action itself is killed. Flip it to failed, keeping
- * its last-known stage so the card shows where it stopped.
+ * block runs when the action itself is killed.
+ *
+ * Two cases, handled differently:
+ *  - queued (the scheduled action never started — nothing happened yet):
+ *    automatically re-schedule the run ONCE. Convex executes actions at
+ *    most once, so a scheduler miss would otherwise hang the upload forever
+ *    with only a manual Retry as recourse. A second miss flips it to failed.
+ *  - processing (the action started and died mid-run): flip to failed,
+ *    keeping the last-known stage so the card shows where it stopped.
+ *    Re-running automatically could overlap real partial work, so these
+ *    stay manual (Retry) on purpose.
  */
 export const failStaleProcessingSources = internalMutation({
   args: {},
@@ -231,12 +242,37 @@ export const failStaleProcessingSources = internalMutation({
       )
       .collect();
 
-    for (const source of [...stale, ...staleQueued]) {
+    for (const source of stale) {
       await ctx.db.patch(source._id, {
         status: "failed",
         error:
           "Processing didn't complete (the run was interrupted). Nothing was lost — hit Retry to re-run it from the same file.",
         updatedAt: Date.now(),
+      });
+    }
+
+    for (const source of staleQueued) {
+      // Already re-scheduled once and it STILL never started: stop trying.
+      if (source.requeuedAt !== undefined) {
+        await ctx.db.patch(source._id, {
+          status: "failed",
+          error:
+            "Processing never started after an automatic retry. Hit Retry to try again from the same file.",
+          updatedAt: Date.now(),
+        });
+        continue;
+      }
+      // One free automatic requeue: cheap (no partial data to conflict with)
+      // and turns a scheduler miss into a self-healing blip for the student.
+      await ctx.db.patch(source._id, {
+        requeuedAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+      await ctx.scheduler.runAfter(0, internal.processSourceActions.processSource, {
+        sourceId: source._id,
+        userId: source.userId,
+        storageId: source.storageId,
+        type: source.type,
       });
     }
   },

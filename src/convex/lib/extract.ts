@@ -137,13 +137,35 @@ interface PdfjsModule {
 // `structuredClone` transfers the Convex runtime rejects, so we pin the
 // proven legacy line).
 //
-// The package ships a UMD/CJS bundle. Under bundlers (tsx, vite) interop
-// unwraps it, but the Convex Node runtime hands actions the raw namespace,
-// where the API lives under `.default` — calling `mod.getDocument` directly
-// threw "(intermediate value).getDocument is not a function". Handle both
-// shapes and fail loudly here if neither matches, instead of a cryptic
-// TypeError mid-extraction.
+// Two environment quirks handled here:
+// 1. The package ships a UMD/CJS bundle. Under bundlers (tsx, vite) interop
+//    unwraps it, but the Convex Node runtime hands actions the raw namespace,
+//    where the API lives under `.default` — calling `mod.getDocument` directly
+//    threw "(intermediate value).getDocument is not a function". Handle both
+//    shapes and fail loudly here if neither matches.
+// 2. pdf.js's fake-worker fallback resolves the worker via a RELATIVE
+//    `require("./pdf.worker.js")`, which cannot resolve inside Convex's
+//    bundle ("Cannot find module './pdf.worker.js'"). It only tries that
+//    when `globalThis.pdfjsWorker` is unset — so we import the worker entry
+//    and register it globally first. Works identically in plain Node.
 async function importPdfjs(): Promise<PdfjsModule> {
+  if (
+    typeof (globalThis as Record<string, unknown>).pdfjsWorker === "undefined"
+  ) {
+    try {
+      // The worker bundle ships untyped (only the main entry has d.ts).
+      // @ts-expect-error — no declaration file for the pdfjs worker entry
+      const worker = (await import("pdfjs-dist/legacy/build/pdf.worker.js")) as unknown as Record<string, unknown>;
+      const workerImpl =
+        worker.WorkerMessageHandler !== undefined
+          ? worker
+          : ((worker.default as Record<string, unknown> | undefined) ?? worker);
+      (globalThis as Record<string, unknown>).pdfjsWorker = workerImpl;
+    } catch {
+      // Registration is best-effort: if it fails, pdf.js will surface its
+      // own (clearer) worker-setup error, which our caller reports.
+    }
+  }
   const mod = (await import("pdfjs-dist/legacy/build/pdf.js")) as unknown as {
     getDocument?: unknown;
     default?: { getDocument?: unknown } | undefined;

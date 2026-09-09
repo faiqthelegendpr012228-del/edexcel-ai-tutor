@@ -17,6 +17,9 @@ export const markSourceProcessing = internalMutation({
       // A fresh run starts the stage ladder from scratch.
       stage: "queued",
       stageDetail: undefined,
+      // The run actually started: give it a fresh auto-requeue budget in case
+      // a future scheduled run never starts at all.
+      requeuedAt: undefined,
       updatedAt: Date.now(),
     });
   },
