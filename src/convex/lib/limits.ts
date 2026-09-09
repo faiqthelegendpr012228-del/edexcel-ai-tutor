@@ -16,6 +16,13 @@ export const LARGE_COOLDOWN_MS = 90 * 60 * 1000; // 90 minutes
  * watchdog cron marks it failed so it can never hang in "Processing". */
 export const SOURCE_STUCK_AFTER_MS = 15 * 60 * 1000; // 15 minutes
 
+/** How long a Gemini File Search upload claim is trusted before another
+ * mirror run may take it over. The lease must outlast the longest legitimate
+ * upload+index (a 150MB file waits up to 8 min for indexing, plus transfer
+ * time) while staying inside the 10-minute Node action cap — so a claim can
+ * never belong to a run that is still alive. */
+export const GEMINI_CLAIM_STALE_MS = 12 * 60 * 1000; // 12 minutes
+
 export function largeUploadRemainingMs(
   lastLargeUploadAt: number | undefined,
   now: number,

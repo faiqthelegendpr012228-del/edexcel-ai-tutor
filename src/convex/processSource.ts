@@ -1,5 +1,6 @@
 import { v } from "convex/values";
 import { internalMutation, internalQuery } from "./_generated/server";
+import { GEMINI_CLAIM_STALE_MS } from "./lib/limits";
 
 // Internal source-processing pipeline state transitions. The heavy lifting
 // (file parsing, embedding, Gemini upload) runs in Node-runtime actions in
@@ -220,6 +221,90 @@ export const setGeminiDocName = internalMutation({
     if (!source || source.userId !== args.userId) return;
     await ctx.db.patch(args.sourceId, {
       geminiDocName: args.geminiDocName,
+      // Upload finished — the claim has served its purpose either way.
+      geminiUploadClaimAt: undefined,
+      geminiUploadClaimedBy: undefined,
+      updatedAt: Date.now(),
+    });
+  },
+});
+
+/**
+ * Atomically claim the right to upload this source to the Gemini store.
+ * Runs as ONE mutation: get + decide + patch happen inside a single
+ * transaction, so two racing runs can never both pass a stale check (the
+ * check-then-act race that produced duplicate documents). A run that loses
+ * the race aborts without uploading anything.
+ *
+ * A claim is honored while younger than GEMINI_CLAIM_STALE_MS. Past that,
+ * the owning run must be dead (the Node action cap is 10 min), so the
+ * claim is taken over — a crashed mirror never wedges the row permanently.
+ * If the DB already names a doc, nobody may claim: the upload exists.
+ */
+export const claimGeminiUpload = internalMutation({
+  args: { sourceId: v.id("sources"), runId: v.string() },
+  handler: async (ctx, args) => {
+    const source = await ctx.db.get(args.sourceId);
+    if (!source) return { claimed: false, reason: "missing" as const };
+    if (source.geminiDocName) {
+      return { claimed: false, reason: "indexed" as const };
+    }
+    const now = Date.now();
+    if (
+      source.geminiUploadClaimAt !== undefined &&
+      now - source.geminiUploadClaimAt < GEMINI_CLAIM_STALE_MS &&
+      source.geminiUploadClaimedBy !== args.runId
+    ) {
+      return { claimed: false, reason: "claimed" as const };
+    }
+    await ctx.db.patch(args.sourceId, {
+      geminiUploadClaimAt: now,
+      geminiUploadClaimedBy: args.runId,
+      updatedAt: now,
+    });
+    return { claimed: true, reason: "ok" as const };
+  },
+});
+
+/**
+ * Another source row owned by the same student that already recorded a store
+ * document for the same display name — i.e. the upload already exists and a
+ * second copy would be a duplicate.
+ */
+export const _findGeminiDuplicate = internalQuery({
+  args: {
+    userId: v.id("users"),
+    name: v.string(),
+    excludeSourceId: v.id("sources"),
+  },
+  handler: async (ctx, args) => {
+    const rows = await ctx.db
+      .query("sources")
+      .withIndex("by_user", (q) => q.eq("userId", args.userId))
+      .collect();
+    const match = rows.find(
+      (s) =>
+        s._id !== args.excludeSourceId &&
+        s.name === args.name &&
+        s.geminiDocName !== undefined,
+    );
+    return match?.geminiDocName ?? null;
+  },
+});
+
+/**
+ * Drop a claim whose run failed or skipped. Only the owning run can clear
+ * it directly; the staleness window handles crashed runs.
+ */
+export const releaseGeminiClaim = internalMutation({
+  args: { sourceId: v.id("sources"), runId: v.string() },
+  handler: async (ctx, args) => {
+    const source = await ctx.db.get(args.sourceId);
+    if (!source) return;
+    if (source.geminiUploadClaimedBy !== args.runId) return;
+    await ctx.db.patch(args.sourceId, {
+      geminiUploadClaimAt: undefined,
+      geminiUploadClaimedBy: undefined,
       updatedAt: Date.now(),
     });
   },

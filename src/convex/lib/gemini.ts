@@ -239,9 +239,12 @@ export async function uploadToGeminiStore(
     throw new Error("Gemini indexing timed out — retry from the Sources page.");
   }
   const response = op.response as
-    | { document?: { name?: string } }
+    | { documentName?: string; document?: { name?: string } }
     | undefined;
-  const docName = response?.document?.name;
+  // The REST API returns { parent, documentName } (verified empirically with
+  // a live upload); older SDK typings suggested document.name — read both so
+  // a SDK update can't silently break the "already indexed" guard again.
+  const docName = response?.documentName ?? response?.document?.name;
   if (!docName) {
     throw new Error("Gemini indexing finished but no document name was returned.");
   }

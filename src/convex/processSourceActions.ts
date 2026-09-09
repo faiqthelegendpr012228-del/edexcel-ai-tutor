@@ -25,6 +25,7 @@ import {
   type Chunk,
 } from "./lib/extract";
 import {
+  deleteFromGeminiStore,
   hasGeminiKey,
   resolveGeminiStoreName,
   uploadToGeminiStore,
@@ -348,6 +349,14 @@ async function detectTopics(text: string): Promise<string[]> {
  * Push the uploaded file into the Gemini File Search Store tagged with the
  * owner and subject metadata, so tutor answers can be scoped per student and
  * per subject. Runs alongside (not inside) the local extraction pipeline.
+ *
+ * Race safety: eligibility is decided by an ATOMIC claim mutation before any
+ * bytes move, and the claim is released on every exit path. Two concurrent
+ * runs (create + retry, or a watchdog requeue) can therefore never both
+ * upload — the loser aborts with zero store writes. As a second layer, the
+ * row is re-checked after the upload completes and any document created by a
+ * racing winner is deleted, so no duplicate can survive even if claims were
+ * bypassed.
  */
 export const uploadToGemini = internalAction({
   args: {
@@ -357,11 +366,23 @@ export const uploadToGemini = internalAction({
   },
   handler: async (ctx, args) => {
     if (!hasGeminiKey()) return;
+    const runId = `${args.sourceId}@${Date.now()}`;
+
     const source = await ctx.runQuery(internal.processSource._getSource, {
       sourceId: args.sourceId,
     });
     if (!source || source.userId !== args.userId) return;
     if (source.geminiDocName) return; // already indexed
+
+    // ---------------------------------------------------------------
+    // Atomic claim. Anything but "ok" means someone else owns the
+    // upload (or it already exists) — abort with no store writes.
+    // ---------------------------------------------------------------
+    const claim = await ctx.runMutation(internal.processSource.claimGeminiUpload, {
+      sourceId: args.sourceId,
+      runId,
+    });
+    if (!claim.claimed) return;
 
     try {
       const storeName = await resolveGeminiStoreName();
@@ -370,13 +391,40 @@ export const uploadToGemini = internalAction({
       // Pass the storage blob straight through (wrapped to attach the mime
       // type) — no full-file copy in memory.
       const blob = new Blob([file], { type: geminiMimeForType(source.type) });
+      const displayName = source.name;
       const docName = await uploadToGeminiStore({
         storeName,
         file: blob,
-        displayName: source.name,
+        displayName,
         ownerUserId: args.userId,
         subject: source.subject,
       });
+
+      // Cross-row dedupe: if a racing run's doc with the same owner +
+      // displayName is already recorded, keep it, register it here too, and
+      // delete OUR redundant copy. Belt-and-braces on top of the claim.
+      const dup = await ctx.runQuery(
+        internal.processSource._findGeminiDuplicate,
+        {
+          userId: args.userId,
+          name: displayName,
+          excludeSourceId: args.sourceId,
+        },
+      );
+      if (dup) {
+        try {
+          await deleteFromGeminiStore(docName);
+        } catch {
+          // Non-fatal: the extra doc costs retrieval noise, not correctness.
+        }
+        await ctx.runMutation(internal.processSource.setGeminiDocName, {
+          sourceId: args.sourceId,
+          userId: args.userId,
+          geminiDocName: dup,
+        });
+        return;
+      }
+
       await ctx.runMutation(internal.processSource.setGeminiDocName, {
         sourceId: args.sourceId,
         userId: args.userId,
@@ -387,6 +435,13 @@ export const uploadToGemini = internalAction({
       console.error(
         `[sources] Gemini upload failed for ${args.sourceId}: ${err instanceof Error ? err.message : err}`,
       );
+    } finally {
+      // Our run is done (success, skip, or failure) — drop the claim so a
+      // future retry isn't blocked by it. Never clears another run's claim.
+      await ctx.runMutation(internal.processSource.releaseGeminiClaim, {
+        sourceId: args.sourceId,
+        runId,
+      });
     }
   },
 });

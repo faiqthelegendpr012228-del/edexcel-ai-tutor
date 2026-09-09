@@ -10,6 +10,7 @@ import {
 import { internal } from "./_generated/api";
 import { QUALIFICATIONS } from "../lib/curriculum";
 import {
+  GEMINI_CLAIM_STALE_MS,
   LARGE_FILE_BYTES,
   LARGE_COOLDOWN_MS,
   largeUploadRemainingMs,
@@ -182,6 +183,15 @@ export const retrySource = mutation({
     if (!source || source.userId !== userId) throw new Error("Source not found");
     if (source.status === "ready") throw new Error("Source is already ready");
 
+    // A claim younger than GEMINI_CLAIM_STALE_MS belongs to a mirror run
+    // that may still be alive (Node actions cap at 10 min < 12 min window) —
+    // leave it alone. A STALE claim belongs to a dead run: clear it so this
+    // retry's mirror can claim the row instead of being blocked for an hour.
+    const claimAge =
+      source.geminiUploadClaimAt !== undefined
+        ? Date.now() - source.geminiUploadClaimAt
+        : undefined;
+
     await ctx.db.patch(args.sourceId, {
       status: "queued",
       stage: "queued",
@@ -189,6 +199,12 @@ export const retrySource = mutation({
       error: undefined,
       // Fresh manual run: restore the one-shot automatic requeue budget.
       requeuedAt: undefined,
+      ...(claimAge !== undefined && claimAge >= GEMINI_CLAIM_STALE_MS
+        ? {
+            geminiUploadClaimAt: undefined,
+            geminiUploadClaimedBy: undefined,
+          }
+        : {}),
       updatedAt: Date.now(),
     });
 

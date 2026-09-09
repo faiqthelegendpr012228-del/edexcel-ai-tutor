@@ -128,6 +128,15 @@ const schema = defineSchema(
       // (e.g. fileSearchStores/…/documents/xyz). Set once the upload/index
       // step completes; used to remove it from the store on delete.
       geminiDocName: v.optional(v.string()),
+      // Atomic upload claim for the Gemini mirror: a timestamp taken INSIDE
+      // the claim mutation. If another mirror run finds a fresh claim, it
+      // aborts before uploading — closing the check-then-upload race that
+      // created duplicate store documents. The run that set it releases it
+      // when its upload finishes (success or failure).
+      geminiUploadClaimAt: v.optional(v.number()),
+      // The specific run that owns the claim (sourceId@startTime), so a
+      // second claimant knows whether the claim is its own.
+      geminiUploadClaimedBy: v.optional(v.string()),
       createdAt: v.number(),
       updatedAt: v.number(),
     })
