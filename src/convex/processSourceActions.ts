@@ -1,12 +1,16 @@
 //
-// Runs in the Node runtime: file parsing (Buffer via lib/extract) and the
-// Gemini SDK both require it. Without this directive the action lands in the
-// V8 runtime where `Buffer` is undefined and every upload dies with
-// "Buffer is not defined".
+// Node-runtime actions for the source-processing pipeline. Split from
+// `processSource.ts` because Convex only allows actions in "use node" files,
+// while that module also hosts the mutations/queries these actions call
+// (internal.processSource.*).
+//
+// Runs in Node: file parsing (Buffer via lib/extract) and the Gemini SDK both
+// require it. Without the directive the action lands in the V8 runtime where
+// `Buffer` is undefined and every upload dies with "Buffer is not defined".
 "use node";
 
 import { v } from "convex/values";
-import { internalAction, internalMutation, internalQuery } from "./_generated/server";
+import { internalAction } from "./_generated/server";
 import { internal } from "./_generated/api";
 import {
   EMBEDDING_MODEL,
@@ -26,10 +30,6 @@ import {
   uploadToGeminiStore,
 } from "./lib/gemini";
 import { LARGE_PAGE_COUNT } from "./lib/limits";
-
-// Internal source-processing pipeline (scheduled from `createSource` and
-// `retrySource`). Lives in its own module so `sources.ts` can reference these
-// through `internal.processSource.*` without circular type inference.
 
 // Sanity caps so a single upload can't blow through action timeouts/costs.
 // 600 pages covers full textbooks; chunking keeps ~1500 chars per passage.
@@ -263,207 +263,6 @@ async function detectTopics(text: string): Promise<string[]> {
   }
   return [];
 }
-
-export const markSourceProcessing = internalMutation({
-  args: { sourceId: v.id("sources"), userId: v.id("users") },
-  handler: async (ctx, args) => {
-    const source = await ctx.db.get(args.sourceId);
-    if (!source || source.userId !== args.userId) return;
-    await ctx.db.patch(args.sourceId, {
-      status: "processing",
-      updatedAt: Date.now(),
-    });
-  },
-});
-
-export const markSourceFailed = internalMutation({
-  args: {
-    sourceId: v.id("sources"),
-    userId: v.id("users"),
-    error: v.string(),
-  },
-  handler: async (ctx, args) => {
-    const source = await ctx.db.get(args.sourceId);
-    if (!source || source.userId !== args.userId) return;
-    await ctx.db.patch(args.sourceId, {
-      status: "failed",
-      error: args.error,
-      updatedAt: Date.now(),
-    });
-  },
-});
-
-export const writeChunks = internalMutation({
-  args: {
-    sourceId: v.id("sources"),
-    userId: v.id("users"),
-    chunks: v.array(
-      v.object({
-        content: v.string(),
-        page: v.optional(v.number()),
-        position: v.number(),
-      }),
-    ),
-    embeddings: v.optional(v.array(v.array(v.float64()))),
-    replaceExisting: v.optional(v.boolean()),
-    pageCount: v.optional(v.number()),
-  },
-  handler: async (ctx, args) => {
-    const source = await ctx.db.get(args.sourceId);
-    if (!source || source.userId !== args.userId) return;
-
-    // First batch of a (re)processing run: replace any previously stored
-    // chunks so re-tries don't duplicate passages.
-    if (args.replaceExisting) {
-      const existing = await ctx.db
-        .query("chunks")
-        .withIndex("by_source", (q) => q.eq("sourceId", args.sourceId))
-        .collect();
-      for (const chunk of existing) {
-        await ctx.db.delete(chunk._id);
-      }
-    }
-
-    for (let i = 0; i < args.chunks.length; i++) {
-      const chunk = args.chunks[i];
-      await ctx.db.insert("chunks", {
-        userId: args.userId,
-        sourceId: args.sourceId,
-        content: chunk.content,
-        page: chunk.page,
-        position: chunk.position,
-        embedding: args.embeddings?.[i],
-      });
-    }
-
-    await ctx.db.patch(args.sourceId, {
-      ...(args.pageCount !== undefined && { pageCount: args.pageCount }),
-      updatedAt: Date.now(),
-    });
-  },
-});
-
-export const markSourceReady = internalMutation({
-  args: {
-    sourceId: v.id("sources"),
-    userId: v.id("users"),
-    chunkCount: v.number(),
-    pageCount: v.optional(v.number()),
-    topicsDetected: v.optional(v.array(v.string())),
-    retrievalMode: v.union(v.literal("semantic"), v.literal("keyword")),
-    embeddingModel: v.optional(v.string()),
-  },
-  handler: async (ctx, args) => {
-    const source = await ctx.db.get(args.sourceId);
-    if (!source || source.userId !== args.userId) return;
-    await ctx.db.patch(args.sourceId, {
-      status: "ready",
-      chunkCount: args.chunkCount,
-      pageCount: args.pageCount,
-      topicsDetected: args.topicsDetected,
-      retrievalMode: args.retrievalMode,
-      ...(args.embeddingModel !== undefined
-        ? { embeddingModel: args.embeddingModel }
-        : {}),
-      error: undefined,
-      updatedAt: Date.now(),
-    });
-  },
-});
-
-export const markSourceProgress = internalMutation({
-  args: {
-    sourceId: v.id("sources"),
-    userId: v.id("users"),
-    pageCount: v.optional(v.number()),
-  },
-  handler: async (ctx, args) => {
-    const source = await ctx.db.get(args.sourceId);
-    if (!source || source.userId !== args.userId) return;
-    await ctx.db.patch(args.sourceId, {
-      ...(args.pageCount !== undefined && { pageCount: args.pageCount }),
-      updatedAt: Date.now(),
-    });
-  },
-});
-
-export const deleteSourceData = internalMutation({
-  args: { sourceId: v.id("sources"), userId: v.id("users") },
-  handler: async (ctx, args) => {
-    const source = await ctx.db.get(args.sourceId);
-    if (!source || source.userId !== args.userId) return;
-
-    const chunks = await ctx.db
-      .query("chunks")
-      .withIndex("by_source", (q) => q.eq("sourceId", args.sourceId))
-      .collect();
-    for (const chunk of chunks) {
-      await ctx.db.delete(chunk._id);
-    }
-
-    // Drop the source from every chat that had it selected.
-    const chats = await ctx.db
-      .query("chats")
-      .withIndex("by_user_updated", (q) => q.eq("userId", args.userId))
-      .collect();
-    for (const chat of chats) {
-      if (chat.selectedSourceIds.includes(args.sourceId)) {
-        await ctx.db.patch(chat._id, {
-          selectedSourceIds: chat.selectedSourceIds.filter(
-            (id) => id !== args.sourceId,
-          ),
-          updatedAt: Date.now(),
-        });
-      }
-    }
-
-    await ctx.db.delete(args.sourceId);
-  },
-});
-
-export const _getSource = internalQuery({
-  args: { sourceId: v.id("sources") },
-  handler: async (ctx, args) => {
-    return await ctx.db.get(args.sourceId);
-  },
-});
-
-export const setGeminiDocName = internalMutation({
-  args: {
-    sourceId: v.id("sources"),
-    userId: v.id("users"),
-    geminiDocName: v.string(),
-  },
-  handler: async (ctx, args) => {
-    const source = await ctx.db.get(args.sourceId);
-    if (!source || source.userId !== args.userId) return;
-    await ctx.db.patch(args.sourceId, {
-      geminiDocName: args.geminiDocName,
-      updatedAt: Date.now(),
-    });
-  },
-});
-
-/** Stamp the large-upload cooldown from page-count-based largeness. */
-export const stampLargeUpload = internalMutation({
-  args: { userId: v.id("users") },
-  handler: async (ctx, args) => {
-    const row = await ctx.db
-      .query("uploadCooldowns")
-      .withIndex("by_user", (q) => q.eq("userId", args.userId))
-      .first();
-    const now = Date.now();
-    if (row) {
-      await ctx.db.patch(row._id, { lastLargeUploadAt: now, updatedAt: now });
-    } else {
-      await ctx.db.insert("uploadCooldowns", {
-        userId: args.userId,
-        lastLargeUploadAt: now,
-        updatedAt: now,
-      });
-    }
-  },
-});
 
 /**
  * Push the uploaded file into the Gemini File Search Store tagged with the

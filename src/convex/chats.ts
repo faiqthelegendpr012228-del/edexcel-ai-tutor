@@ -3,6 +3,7 @@ import { v, type GenericId } from "convex/values";
 import { action, mutation, query, type ActionCtx } from "./_generated/server";
 import { internal } from "./_generated/api";
 import {
+  EMBEDDING_MODEL,
   embedTexts,
   hasEmbeddingsConfigured,
   streamChatCompletion,
@@ -187,10 +188,21 @@ async function retrieveChunks(
 ): Promise<RetrievedChunk[]> {
   const { userId, query, sourceIds } = opts;
 
-  // 1) Semantic search when embeddings are available.
-  if (hasEmbeddingsConfigured()) {
+  // 1) Semantic search when embeddings are available. Skipped when ANY
+  //    selected source still holds vectors from an older embedding model —
+  //    those hits would land in the wrong vector space. The pipeline
+  //    re-embeds such sources on their next process/retry, after which
+  //    semantic search resumes automatically.
+  if (hasEmbeddingsConfigured() && sourceIds.length > 0) {
     try {
-      const [vector] = await embedTexts([query]);
+      const sources = await ctx.runQuery(internal.chatsInternal._getSourcesByIds, {
+        ids: sourceIds,
+      });
+      const staleModel = sources.some(
+        (s) => s?.retrievalMode === "semantic" && s.embeddingModel !== EMBEDDING_MODEL,
+      );
+      if (!staleModel) {
+      const [vector] = await embedTexts([query], { taskType: "RETRIEVAL_QUERY" });
       const hits = await ctx.vectorSearch("chunks", "by_embedding", {
         vector,
         limit: 12,
@@ -212,6 +224,7 @@ async function retrieveChunks(
           page: d.page,
           sourceId: d.sourceId,
         }));
+      }
     } catch (err) {
       console.warn("[chats] Semantic retrieval failed, falling back:", err);
     }

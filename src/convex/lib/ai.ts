@@ -19,13 +19,24 @@ import {
  *   routed to the right host automatically. OpenRouter 402 (low credits) is
  *   handled by retrying with the token budget the account can actually
  *   afford.
- * - Embeddings: OpenAI `text-embedding-3-small` via direct API. Requires a
- *   real OpenAI key (OpenRouter does not expose an embeddings endpoint).
- *   When unavailable, the RAG pipeline gracefully falls back to keyword
- *   search.
+ * - Embeddings: Gemini `gemini-embedding-001` via the same GEMINI_API_KEY
+ *   used for the tutor (one provider to manage). Embeddings are only used by
+ *   the local-RAG fallback chain — the primary tutor path uses Gemini File
+ *   Search. When unavailable, the RAG pipeline gracefully falls back to
+ *   keyword search.
  */
 
-export const EMBEDDING_MODEL = "text-embedding-3-small";
+/**
+ * Embedding model for the local RAG fallback chain.
+ *
+ * Verified 2026-09 against https://ai.google.dev/gemini-api/docs/embeddings:
+ * `gemini-embedding-001` (NOT the newer gemini-embedding-2 — that one
+ * aggregates multiple inputs into a single embedding, which is wrong for
+ * one-vector-per-chunk retrieval). Native output is 3072 dims; we request
+ * 1536 via outputDimensionality, which happens to match the previous OpenAI
+ * index size so the Convex vector index needed no dimension change.
+ */
+export const EMBEDDING_MODEL = "gemini-embedding-001";
 export const EMBEDDING_DIMENSIONS = 1536;
 
 // Model routing (v1): cheap model for lightweight tasks, flagship for tutoring.
@@ -39,7 +50,7 @@ export const MODELS = {
 
 export class EmbeddingsNotConfiguredError extends Error {
   constructor(reason?: string) {
-    super(reason ?? "OPENAI_API_KEY is not configured");
+    super(reason ?? "GEMINI_API_KEY is not configured");
     this.name = "EmbeddingsNotConfiguredError";
   }
 }
@@ -58,10 +69,12 @@ function openRouterModelName(model: string): string {
   return model.includes("/") ? model : `openai/${model}`;
 }
 
+/**
+ * Embeddings run on the same Gemini key as everything else, so the check is
+ * simply whether that key exists.
+ */
 export function hasEmbeddingsConfigured(): boolean {
-  const key = process.env.OPENAI_API_KEY;
-  // OpenRouter keys can't call the embeddings endpoint.
-  return !!key && !isOpenRouterKey(key);
+  return hasGeminiKey();
 }
 
 export interface ChatMessage {
@@ -426,54 +439,61 @@ export async function chatCompletion(
 }
 
 /**
- * Embed a batch of texts. Returns one vector per input, in the same order.
- * Throws EmbeddingsNotConfiguredError when no usable OpenAI key is present
- * (OpenRouter keys don't support the embeddings API).
+ * Embed a batch of texts with Gemini embeddings. Returns one vector per
+ * input, in the same order. Throws EmbeddingsNotConfiguredError when no
+ * Gemini key is present.
+ *
+ * Batch input via the `requests` array form of embedContent (one request per
+ * text). Asymmetric retrieval formatting: queries are prefixed with the
+ * RETRIEVAL_QUERY task instruction, documents with RETRIEVAL_DOCUMENT —
+ * matching the formats Google documents for search use cases.
  */
-export async function embedTexts(texts: string[]): Promise<number[][]> {
-  const key = process.env.OPENAI_API_KEY;
-  if (!key) {
+export async function embedTexts(
+  texts: string[],
+  opts?: { taskType?: "RETRIEVAL_QUERY" | "RETRIEVAL_DOCUMENT" },
+): Promise<number[][]> {
+  if (!hasGeminiKey()) {
     throw new EmbeddingsNotConfiguredError();
-  }
-  if (isOpenRouterKey(key)) {
-    throw new EmbeddingsNotConfiguredError(
-      "Embeddings require a real OpenAI key — OpenRouter keys don't support the embeddings API. Keyword search is used instead.",
-    );
   }
   if (texts.length === 0) return [];
 
+  const task = opts?.taskType ?? "RETRIEVAL_DOCUMENT";
+  const { getGeminiClient } = await import("./gemini");
+  const ai = getGeminiClient();
+
+  // Gemini embeds up to 100 texts per request; 32 keeps request payloads
+  // modest and matches the caller's existing batch cadence.
   const BATCH_SIZE = 32;
   const all: number[][] = [];
   for (let i = 0; i < texts.length; i += BATCH_SIZE) {
     const batch = texts.slice(i, i + BATCH_SIZE);
-    const res = await fetch("https://api.openai.com/v1/embeddings", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${key}`,
+    // For gemini-embedding-001 an array under `contents` returns one
+    // embedding per input, in order. Task type rides in `config` (the
+    // text-prefix convention is for embedding-2, which we deliberately
+    // don't use — it aggregates multi-input requests into one vector).
+    const res = await ai.models.embedContent({
+      model: EMBEDDING_MODEL,
+      contents: batch,
+      config: {
+        taskType: task,
+        outputDimensionality: EMBEDDING_DIMENSIONS,
       },
-      body: JSON.stringify({ model: EMBEDDING_MODEL, input: batch }),
     });
-    if (!res.ok) {
-      const body = await res.text().catch(() => "");
+    const embeddings = res.embeddings ?? [];
+    if (embeddings.length !== batch.length) {
       throw new Error(
-        `Embeddings request failed (${res.status}): ${body.slice(0, 300)}`,
+        `Embeddings response count mismatch: got ${embeddings.length}, expected ${batch.length}`,
       );
     }
-    const data = (await res.json()) as {
-      data: Array<{ index: number; embedding: number[] }>;
-    };
-    const ordered = [...data.data]
-      .sort((a, b) => a.index - b.index)
-      .map((d) => d.embedding);
-    for (const vec of ordered) {
+    for (const emb of embeddings) {
+      const vec = emb.values ?? [];
       if (vec.length !== EMBEDDING_DIMENSIONS) {
         throw new Error(
           `Unexpected embedding dimension ${vec.length} (expected ${EMBEDDING_DIMENSIONS})`,
         );
       }
+      all.push(vec);
     }
-    all.push(...ordered);
   }
   return all;
 }

@@ -78,6 +78,14 @@ export const _searchChunks = internalQuery({
   },
 });
 
+export const _getSourcesByIds = internalQuery({
+  args: { ids: v.array(v.id("sources")) },
+  handler: async (ctx, args) => {
+    const docs = await Promise.all(args.ids.map((id) => ctx.db.get(id)));
+    return docs.filter((d): d is NonNullable<typeof d> => !!d);
+  },
+});
+
 export const _insertMessage = internalMutation({
   args: {
     userId: v.id("users"),

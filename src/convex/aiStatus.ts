@@ -6,17 +6,19 @@ import { query } from "./_generated/server";
 export const getStatus = query({
   args: {},
   handler: async () => {
+    // Gemini is the single AI provider: File Search grounding for tutor
+    // answers, embeddings for the local-RAG fallback chain, and quick-task
+    // completions all run off the same key.
+    const geminiKey = !!process.env.GEMINI_API_KEY;
     return {
       // Gemini File Search grounding for tutor answers.
-      geminiFileSearch: !!process.env.GEMINI_API_KEY,
-      // OpenAI key present → semantic retrieval enabled for the local RAG
-      // fallback. Absent/OpenRouter → keyword search fallback keeps sources
+      geminiFileSearch: geminiKey,
+      // Gemini key present → semantic retrieval enabled for the local RAG
+      // fallback chain. Absent → keyword search fallback keeps sources
       // usable.
-      embeddingsConfigured:
-        !!process.env.OPENAI_API_KEY &&
-        !process.env.OPENAI_API_KEY.startsWith("sk-or-"),
+      embeddingsConfigured: geminiKey,
       // Chat capability: Gemini (preferred) or the platform VLY gateway.
-      chatConfigured: !!process.env.GEMINI_API_KEY || !!process.env.VLY_INTEGRATION_KEY,
+      chatConfigured: geminiKey || !!process.env.VLY_INTEGRATION_KEY,
     };
   },
 });

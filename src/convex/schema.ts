@@ -97,6 +97,11 @@ const schema = defineSchema(
       chunkCount: v.optional(v.number()),
       topicsDetected: v.optional(v.array(v.string())),
       retrievalMode: v.optional(retrievalModeValidator),
+      // Which embedding model produced the stored chunk vectors. Sources
+      // whose stamp differs from the current EMBEDDING_MODEL are re-embedded
+      // on their next process/retry so semantic search never mixes vector
+      // spaces.
+      embeddingModel: v.optional(v.string()),
       error: v.optional(v.string()),
       // Resource name of the document inside the Gemini File Search Store
       // (e.g. fileSearchStores/…/documents/xyz). Set once the upload/index
