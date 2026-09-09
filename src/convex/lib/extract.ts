@@ -29,12 +29,16 @@ export class UnsupportedFormatError extends Error {
 export async function extractText(
   type: string,
   bytes: ArrayBuffer,
-  opts?: { pageConcurrency?: number },
+  opts?: {
+    pageConcurrency?: number;
+    /** Called as pages complete so callers can persist live progress. */
+    onProgress?: (donePages: number, totalPages: number) => void;
+  },
 ): Promise<ExtractedDocument> {
   const buffer = Buffer.from(bytes);
   switch (type) {
     case "pdf":
-      return extractPdf(buffer, opts?.pageConcurrency ?? 6);
+      return extractPdf(buffer, opts?.pageConcurrency ?? 6, opts?.onProgress);
     case "docx":
       return extractDocx(buffer);
     case "pptx":
@@ -56,6 +60,7 @@ export async function extractText(
 async function extractPdf(
   buffer: Buffer,
   pageConcurrency: number,
+  onProgress?: (donePages: number, totalPages: number) => void,
 ): Promise<ExtractedDocument> {
   const pdfjs = await importPdfjs();
   const doc = await pdfjs.getDocument({
@@ -84,6 +89,7 @@ async function extractPdf(
     // Text extraction is CPU-bound per page, so pages are processed in
     // parallel slices — this is the single biggest wall-clock win for
     // multi-hundred-page textbooks. Results land in page order.
+    let done = 0;
     for (let start = 1; start <= total; start += pageConcurrency) {
       const end = Math.min(start + pageConcurrency - 1, total);
       const group: Promise<void>[] = [];
@@ -91,6 +97,8 @@ async function extractPdf(
         group.push(extractPage(n));
       }
       await Promise.all(group);
+      done += end - start + 1;
+      onProgress?.(done, total);
     }
 
     const parts: string[] = [];

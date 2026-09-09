@@ -34,7 +34,17 @@ export const sourceStatusValidator = v.union(
   v.literal("failed"),
 );
 
-export const retrievalModeValidator = v.union(
+// Stages of the processing pipeline, in order. Persisted on the source so
+// progress survives reloads and a mid-stage failure keeps its last stage.
+const sourceStageValidator = v.union(
+  v.literal("queued"),
+  v.literal("extracting"),
+  v.literal("chunking"),
+  v.literal("embedding"),
+  v.literal("finalizing"),
+);
+
+const retrievalModeValidator = v.union(
   v.literal("semantic"),
   v.literal("keyword"),
 );
@@ -93,6 +103,13 @@ const schema = defineSchema(
       collectionId: v.optional(v.id("collections")),
       size: v.number(),
       status: sourceStatusValidator,
+      // Real pipeline stage (queued → extracting → chunking → embedding),
+      // persisted as processing happens so the UI can show live progress and
+      // a failed source keeps its last-known stage for diagnosis.
+      stage: v.optional(sourceStageValidator),
+      // Optional intra-stage progress, e.g. "212/430" pages extracted or
+      // "64/120" chunk batches embedded.
+      stageDetail: v.optional(v.string()),
       pageCount: v.optional(v.number()),
       chunkCount: v.optional(v.number()),
       topicsDetected: v.optional(v.array(v.string())),
@@ -111,7 +128,10 @@ const schema = defineSchema(
       updatedAt: v.number(),
     })
       .index("by_user", ["userId"])
-      .index("by_user_status", ["userId", "status"]),
+      .index("by_user_status", ["userId", "status"])
+      // Watchdog: find processing/queued sources whose run died, regardless
+      // of owner.
+      .index("by_status_updated", ["status", "updatedAt"]),
 
     // One row per grounded File Search query, for per-student usage logging
     // and quota enforcement. `windowStart` is the start of the rolling

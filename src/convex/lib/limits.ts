@@ -12,6 +12,10 @@ export const LARGE_PAGE_COUNT = 100;
 /** One large file per student per window; small files are unlimited. */
 export const LARGE_COOLDOWN_MS = 90 * 60 * 1000; // 90 minutes
 
+/** A source still "processing" after this long is considered dead; the
+ * watchdog cron marks it failed so it can never hang in "Processing". */
+export const SOURCE_STUCK_AFTER_MS = 15 * 60 * 1000; // 15 minutes
+
 export function largeUploadRemainingMs(
   lastLargeUploadAt: number | undefined,
   now: number,

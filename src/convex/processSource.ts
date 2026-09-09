@@ -14,6 +14,39 @@ export const markSourceProcessing = internalMutation({
     if (!source || source.userId !== args.userId) return;
     await ctx.db.patch(args.sourceId, {
       status: "processing",
+      // A fresh run starts the stage ladder from scratch.
+      stage: "queued",
+      stageDetail: undefined,
+      updatedAt: Date.now(),
+    });
+  },
+});
+
+/**
+ * Persist the current pipeline stage (and optional intra-stage progress,
+ * e.g. "212/430") as the action works, so the UI shows live, real progress
+ * and a mid-stage failure keeps its last-known stage for diagnosis.
+ */
+export const markSourceStage = internalMutation({
+  args: {
+    sourceId: v.id("sources"),
+    userId: v.id("users"),
+    stage: v.union(
+      v.literal("extracting"),
+      v.literal("chunking"),
+      v.literal("embedding"),
+      v.literal("finalizing"),
+    ),
+    stageDetail: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const source = await ctx.db.get(args.sourceId);
+    if (!source || source.userId !== args.userId) return;
+    await ctx.db.patch(args.sourceId, {
+      stage: args.stage,
+      ...(args.stageDetail !== undefined
+        ? { stageDetail: args.stageDetail }
+        : { stageDetail: undefined }),
       updatedAt: Date.now(),
     });
   },
@@ -101,6 +134,8 @@ export const markSourceReady = internalMutation({
     if (!source || source.userId !== args.userId) return;
     await ctx.db.patch(args.sourceId, {
       status: "ready",
+      stage: undefined,
+      stageDetail: undefined,
       chunkCount: args.chunkCount,
       pageCount: args.pageCount,
       topicsDetected: args.topicsDetected,

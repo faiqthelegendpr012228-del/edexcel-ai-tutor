@@ -71,11 +71,43 @@ export const processSource = internalAction({
       }
       const bytes = await file.arrayBuffer();
 
+      // -----------------------------------------------------------------
+      // Stage: extracting. PDFs parse page by page, so report real
+      // progress ("212/430") as each parallel slice completes. Writes are
+      // throttled and fire-and-forget: they must never slow or break the
+      // pipeline itself. Each write also refreshes updatedAt, which is the
+      // liveness signal the stuck-source watchdog reads.
+      // -----------------------------------------------------------------
+      await ctx.runMutation(internal.processSource.markSourceStage, {
+        sourceId: args.sourceId,
+        userId: args.userId,
+        stage: "extracting",
+      });
+      let lastProgressWrite = 0;
+      let progressWrite: Promise<unknown> = Promise.resolve();
+      const reportProgress = (done: number, total: number) => {
+        const now = Date.now();
+        if (now - lastProgressWrite < 2000) return;
+        lastProgressWrite = now;
+        progressWrite = progressWrite
+          .then(() =>
+            ctx.runMutation(internal.processSource.markSourceStage, {
+              sourceId: args.sourceId,
+              userId: args.userId,
+              stage: "extracting",
+              stageDetail: `${done}/${total}`,
+            }),
+          )
+          .catch(() => undefined);
+      };
+
       // Parallel page extraction inside extractText (PDF pages are pulled in
       // slices of PDF_EXTRACT_CONCURRENCY).
       const extracted = await extractText(args.type, bytes, {
         pageConcurrency: PDF_EXTRACT_CONCURRENCY,
+        onProgress: reportProgress,
       });
+      await progressWrite.catch(() => undefined);
       const pages = extracted.pages.slice(0, MAX_PAGES_PROCESSED);
       const text = normalizeExtractedText(extracted.text);
       if (!text) {
@@ -85,6 +117,18 @@ export const processSource = internalAction({
         return;
       }
 
+      // -----------------------------------------------------------------
+      // Stage: chunking. Pure CPU over already-extracted text — typically
+      // fast, so it's persisted as a distinct but brief stage rather than
+      // faked with progress counts.
+      // -----------------------------------------------------------------
+      await ctx.runMutation(internal.processSource.markSourceStage, {
+        sourceId: args.sourceId,
+        userId: args.userId,
+        stage: "chunking",
+      });
+      const chunks = chunkDocument({ ...extracted, pages }).slice(0, MAX_CHUNKS);
+
       // Surface the page count immediately so the card shows progress while
       // embeddings are still being generated.
       await ctx.runMutation(internal.processSource.markSourceProgress, {
@@ -92,16 +136,6 @@ export const processSource = internalAction({
         userId: args.userId,
         pageCount: pages.length,
       });
-
-      // A text-heavy book can be small on disk but still expensive to
-      // process — stamp the large-upload cooldown from page count too.
-      if (pages.length > LARGE_PAGE_COUNT) {
-        await ctx.runMutation(internal.processSource.stampLargeUpload, {
-          userId: args.userId,
-        });
-      }
-
-      const chunks = chunkDocument({ ...extracted, pages }).slice(0, MAX_CHUNKS);
 
       // -------------------------------------------------------------------
       // Embed + write as one pipeline: while the DB write for batch N runs,
@@ -124,6 +158,18 @@ export const processSource = internalAction({
 
       if (hasEmbeddings && chunks.length > 0) {
         try {
+          // -------------------------------------------------------------
+          // Stage: embedding. The write loop below lands chunks in small
+          // batches, so progress is real: writtenChunks/chunks.length is
+          // persisted after every batch write.
+          // -------------------------------------------------------------
+          await ctx.runMutation(internal.processSource.markSourceStage, {
+            sourceId: args.sourceId,
+            userId: args.userId,
+            stage: "embedding",
+            stageDetail: `0/${chunks.length}`,
+          });
+          let writtenChunks = 0;
           const EMBED_BATCH = 32;
           let nextEmbed = 0;
           let inFlight: Promise<number[][]> | null = null;
@@ -180,6 +226,13 @@ export const processSource = internalAction({
               replaceExisting: i === 0,
               pageCount: i === 0 ? pages.length : undefined,
             });
+            writtenChunks += writeBatch.length;
+            await ctx.runMutation(internal.processSource.markSourceStage, {
+              sourceId: args.sourceId,
+              userId: args.userId,
+              stage: "embedding",
+              stageDetail: `${Math.min(writtenChunks, chunks.length)}/${chunks.length}`,
+            });
 
             // Kick off the next embed batch while nothing else is pending.
             startNextEmbed();
@@ -210,6 +263,14 @@ export const processSource = internalAction({
           topics = undefined;
         }
       }
+
+      // Stage: finalizing — topic detection + the ready write. Brief, but
+      // distinct from embedding so a hang here is attributable.
+      await ctx.runMutation(internal.processSource.markSourceStage, {
+        sourceId: args.sourceId,
+        userId: args.userId,
+        stage: "finalizing",
+      });
 
       await ctx.runMutation(internal.processSource.markSourceReady, {
         sourceId: args.sourceId,

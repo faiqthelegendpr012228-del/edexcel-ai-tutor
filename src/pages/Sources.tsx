@@ -36,6 +36,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
+import { Progress } from "@/components/ui/progress";
 
 type SourceDoc = Doc<"sources">;
 type CollectionDoc = Doc<"collections">;
@@ -85,7 +86,9 @@ function StatusBadge({ source }: { source: SourceDoc }) {
       return (
         <Badge variant="secondary" className="gap-1">
           <Loader2 className="size-3 animate-spin" />
-          Processing
+          {source.stage
+            ? (STAGE_LABEL[source.stage] ?? "Processing")
+            : "Processing"}
         </Badge>
       );
     case "queued":
@@ -101,8 +104,97 @@ function StatusBadge({ source }: { source: SourceDoc }) {
 }
 
 // A source stuck in queued/processing for over 10 minutes is treated as
-// retryable — its pipeline run most likely died.
+// retryable — its pipeline run most likely died. The server-side watchdog
+// (crons.ts, 15 min) is the source of truth; this is the faster UI hint.
 const STUCK_AFTER_MS = 10 * 60 * 1000;
+
+// ---------------------------------------------------------------------------
+// Processing stage indicator
+// ---------------------------------------------------------------------------
+
+// The real pipeline stages, in order (must match sourceStageValidator).
+const STAGES = [
+  "queued",
+  "extracting",
+  "chunking",
+  "embedding",
+  "finalizing",
+] as const;
+
+const STAGE_LABEL: Record<string, string> = {
+  queued: "Queued",
+  extracting: "Extracting text",
+  chunking: "Chunking",
+  embedding: "Embedding",
+  finalizing: "Finishing up",
+};
+
+const STAGE_HINT: Record<string, string> = {
+  queued: "Waiting for a processing slot…",
+  extracting: "Reading the file page by page",
+  chunking: "Splitting text into citable passages",
+  embedding: "Building semantic search vectors",
+  finalizing: "Detecting topics and saving",
+};
+
+/**
+ * Live progress for a source card: the real persisted stage plus, where the
+ * pipeline reports it, an "X of Y" count. Data comes straight from the
+ * source record — no fake estimates.
+ */
+function StageIndicator({ source }: { source: SourceDoc }) {
+  const stageIndex = source.stage ? STAGES.indexOf(source.stage) : -1;
+  // Percent of the overall pipeline, weighted by how long stages actually
+  // take: extraction and embedding dominate, chunking/finalizing are brief.
+  const overallPct =
+    stageIndex < 0 ? 0 : Math.round(((stageIndex + 0.5) / STAGES.length) * 100);
+  const [done, total] = parseStageDetail(source.stageDetail);
+
+  return (
+    <div className="mt-2 rounded-lg border bg-muted/30 p-2.5">
+      <div className="flex items-center gap-2">
+        <Loader2 className="size-3.5 shrink-0 animate-spin text-primary" />
+        <span className="text-xs font-medium">
+          {STAGE_LABEL[source.stage ?? "queued"] ?? "Processing"}
+        </span>
+        {done !== null && total !== null && (
+          <span className="ml-auto text-xs tabular-nums text-muted-foreground">
+            {done} of {total}
+          </span>
+        )}
+      </div>
+      {done !== null && total !== null && total > 0 ? (
+        <Progress
+          value={(done / total) * 100}
+          className="mt-1.5 h-1.5"
+          aria-label={`${done} of ${total} ${STAGE_LABEL[source.stage ?? ""] ?? "processing"}`}
+        />
+      ) : (
+        <>
+          <Progress
+            value={overallPct}
+            className="mt-1.5 h-1.5"
+            aria-label={STAGE_LABEL[source.stage ?? ""] ?? "Processing"}
+          />
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            {STAGE_HINT[source.stage ?? ""] ?? "Working…"}
+          </p>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** "64/120" → [64, 120]; anything else → [null, null]. */
+function parseStageDetail(detail?: string): [number | null, number | null] {
+  if (!detail) return [null, null];
+  const m = /^(\d+)\s*\/\s*(\d+)$/.exec(detail.trim());
+  if (!m) return [null, null];
+  const done = Number(m[1]);
+  const total = Number(m[2]);
+  if (!Number.isFinite(done) || !Number.isFinite(total)) return [null, null];
+  return [done, total];
+}
 
 // ---------------------------------------------------------------------------
 // Source card
@@ -169,6 +261,10 @@ function SourceCard({
         )}
       </div>
 
+      {source.status === "processing" && !stuck && (
+        <StageIndicator source={source} />
+      )}
+
       {stuck && source.status !== "failed" && (
         <p className="mt-2 rounded-lg bg-amber-500/10 p-2 text-xs leading-5 text-amber-700 dark:text-amber-400">
           This has been processing for longer than expected — hit Retry to
@@ -176,11 +272,17 @@ function SourceCard({
         </p>
       )}
 
-      {source.status === "failed" &&
-        source.error &&
-        source.error.trim() && (
+      {source.status === "failed" && (
         <p className="mt-2 rounded-lg bg-destructive/10 p-2 text-xs leading-5 text-destructive">
-          {source.error}
+          {source.error?.trim()
+            ? source.error
+            : "Something went wrong while processing this file."}
+          {source.stage && (
+            <span className="mt-1 block font-medium">
+              Failed while {STAGE_LABEL[source.stage]?.toLowerCase() ?? "processing"}
+              {source.stageDetail ? ` (${source.stageDetail})` : ""}.
+            </span>
+          )}
         </p>
       )}
 

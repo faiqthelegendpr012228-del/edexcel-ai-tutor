@@ -1,6 +1,12 @@
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { v, type GenericId } from "convex/values";
-import { action, mutation, query, type MutationCtx } from "./_generated/server";
+import {
+  action,
+  internalMutation,
+  mutation,
+  query,
+  type MutationCtx,
+} from "./_generated/server";
 import { internal } from "./_generated/api";
 import { QUALIFICATIONS } from "../lib/curriculum";
 import {
@@ -8,6 +14,7 @@ import {
   LARGE_COOLDOWN_MS,
   largeUploadRemainingMs,
   formatRemainingCooldown,
+  SOURCE_STUCK_AFTER_MS,
 } from "./lib/limits";
 
 type Id<T extends string> = GenericId<T>;
@@ -177,6 +184,8 @@ export const retrySource = mutation({
 
     await ctx.db.patch(args.sourceId, {
       status: "queued",
+      stage: "queued",
+      stageDetail: undefined,
       error: undefined,
       updatedAt: Date.now(),
     });
@@ -195,6 +204,41 @@ export const retrySource = mutation({
       userId,
       storageId: source.storageId,
     });
+  },
+});
+
+/**
+ * Watchdog (runs every 5 min from crons.ts): a source whose processing
+ * action died mid-run would hang in queued/processing forever — no catch
+ * block runs when the action itself is killed. Flip it to failed, keeping
+ * its last-known stage so the card shows where it stopped.
+ */
+export const failStaleProcessingSources = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    const cutoff = Date.now() - SOURCE_STUCK_AFTER_MS;
+    const stale = await ctx.db
+      .query("sources")
+      .withIndex("by_status_updated", (q) =>
+        q.eq("status", "processing").lt("updatedAt", cutoff),
+      )
+      .collect();
+    // queued sources can get stuck too (e.g. the scheduled action never ran).
+    const staleQueued = await ctx.db
+      .query("sources")
+      .withIndex("by_status_updated", (q) =>
+        q.eq("status", "queued").lt("updatedAt", cutoff),
+      )
+      .collect();
+
+    for (const source of [...stale, ...staleQueued]) {
+      await ctx.db.patch(source._id, {
+        status: "failed",
+        error:
+          "Processing didn't complete (the run was interrupted). Nothing was lost — hit Retry to re-run it from the same file.",
+        updatedAt: Date.now(),
+      });
+    }
   },
 });
 
