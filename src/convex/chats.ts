@@ -17,7 +17,10 @@ import {
 import {
   decideGrounding,
   formatResetIn,
+  TUTOR_GROUNDED_QUOTA_PER_WEEK,
 } from "./lib/limits";
+import { buildSystemPrompt as buildLumenSystemPrompt } from "./lib/prompt";
+import { QUALIFICATIONS } from "../lib/curriculum";
 
 type Id<T extends string> = GenericId<T>;
 
@@ -153,60 +156,15 @@ export const deleteChat = mutation({
 });
 
 // ---------------------------------------------------------------------------
-// Prompt construction
+// Prompt construction — the Lumen template lives in lib/prompt.ts (finalized
+// spec copy). This file only adds the strict-source rules that drive the
+// NEEDS_OUTSIDE_KNOWLEDGE protocol on the local-RAG chain.
 // ---------------------------------------------------------------------------
 
-const BASE_SYSTEM_PROMPT = `You are Lumen, a patient, precise private tutor for Pearson Edexcel students (GCSE, International GCSE, AS, A Level, International A Level).
-
-Teaching principles:
-- Prioritise UNDERSTANDING → PRACTICE → FEEDBACK → RETENTION. Never just hand over an answer without making sure the idea lands.
-- Explain step by step, and check the student actually follows before moving on.
-- You know Edexcel command words (State, Define, Describe, Explain, Compare, Evaluate, Calculate, Suggest, Discuss) and what each demands. When relevant, teach students how to structure an answer worth the stated marks.
-- When you ask the student a question, ask ONE question at a time.
-- Format with markdown: short headings, bullet lists, worked examples as numbered steps. Keep paragraphs short. Never dump a wall of text.
-- End most answers with one concrete next step, e.g. "Want me to test you with a quick question?"`;
-
-function buildSystemPrompt(opts: {
-  qualification?: string;
-  subject?: string;
-  sourcesMode: boolean;
-  context?: Array<{ content: string; sourceName: string; page?: number }>;
-}): string {
-  const parts = [
-    BASE_SYSTEM_PROMPT,
-    "",
-    "Student context:",
-    `- Qualification: ${opts.qualification ?? "not set"}`,
-    `- Focus subject: ${opts.subject ?? "not set"}`,
-  ];
-
-  if (opts.sourcesMode) {
-    parts.push(
-      "",
-      "STRICT SOURCE MODE is ON. Answer ONLY using the passages below, retrieved from the student's own uploaded materials.",
-      "Hard rules:",
-      "1. Every factual claim must come from these passages and carry an inline citation: [Source: <source name>, Page <n>] (omit \", Page <n>\" when the passage has no page number).",
-      `2. If the passages do not contain enough information to answer accurately, reply with EXACTLY one line first: ${NEEDS_OUTSIDE_KNOWLEDGE}, then write "${INSUFFICIENT_SOURCES_MESSAGE}" and briefly note what was missing. Do NOT fall back to general knowledge and do NOT invent citations.`,
-      "3. You may connect ideas across passages and explain them more clearly, but you must not introduce outside facts.",
-      "",
-      "Retrieved passages:",
-    );
-    for (const chunk of opts.context ?? []) {
-      parts.push(
-        `[Source: ${chunk.sourceName}${chunk.page ? `, Page ${chunk.page}` : ""}]`,
-        chunk.content,
-        "---",
-      );
-    }
-  } else {
-    parts.push(
-      "",
-      "You may use your general knowledge. If the student has uploaded their own sources, you can refer to them at a high level, but never fabricate specific citations or page numbers for them.",
-    );
-  }
-
-  return parts.join("\n");
-}
+const STRICT_SOURCE_RULES = `Additional rules for the "Retrieved passages" section above:
+1. Every factual claim must come from those passages and carry an inline citation: [Source: <source name>, Page <n>] (omit ", Page <n>" when the passage has no page number).
+2. If the passages do not contain enough information to answer accurately, reply with EXACTLY one line first: ${NEEDS_OUTSIDE_KNOWLEDGE}, then write "${INSUFFICIENT_SOURCES_MESSAGE}" and briefly note what was missing. Do NOT fall back to general knowledge and do NOT invent citations.
+3. You may connect ideas across passages and explain them more clearly, but you must not introduce outside facts.`;
 
 // ---------------------------------------------------------------------------
 // Retrieval
@@ -343,7 +301,6 @@ export const askTutor = action({
     });
 
     const sourcesMode = chat.sourceMode && !allowOutside;
-
     // Retrieval gating: only turns that genuinely need sources spend a File
     // Search query. Conservative — anything not clearly conversational is
     // grounded. The decision is stored on the message for transparency, and
@@ -365,14 +322,16 @@ export const askTutor = action({
         ? ({ ground: false, reason: "outside" } as const)
         : decideGrounding({ userMessage: content, hasPriorAssistantTurn });
 
-    // Quota only gates turns that would otherwise be grounded. When it's out,
-    // the student still gets an answer — ungrounded, clearly labelled.
+    // Quota: consumed by grounded turns; also injected into the system
+    // prompt ({{quota_remaining}}) and surfaced in the quota-exhausted note.
     let quotaNote: string | undefined;
-    if (sourcesMode && gating.ground) {
+    let quotaRemaining = TUTOR_GROUNDED_QUOTA_PER_WEEK;
+    if (sourcesMode) {
       const quota = await ctx.runQuery(internal.chatsInternal._getQuotaStatus, {
         userId,
       });
-      if (quota.used >= quota.limit) {
+      quotaRemaining = Math.max(0, quota.limit - quota.used);
+      if (gating.ground && quota.used >= quota.limit) {
         const resetIn = formatResetIn(quota.resetsInMs);
         quotaNote = `You've used all ${quota.limit} source-checked answers for this week — they reset in ${resetIn}. Here's the best answer I can give without checking your sources this time.`;
       }
@@ -447,21 +406,40 @@ export const askTutor = action({
       sourceNames = new Map(sources.map((s) => [s._id, s.name]));
     }
 
+    // Resolve the qualification id (e.g. "igcse") to a display name for the
+    // prompt template; fall back to the raw value when unknown.
+    const qualDisplay =
+      QUALIFICATIONS.find((q) => q.id === chat.qualification)?.shortName ??
+      chat.qualification;
+
+    const systemPrompt = buildLumenSystemPrompt({
+      qualification: qualDisplay,
+      subject: chat.subject,
+      mode: groundedThisTurn ? "grounded" : "fallback",
+      quotaRemaining,
+      retriever: groundedThisTurn
+        ? {
+            toolName: sourceNames.size > 0 ? "your uploaded sources (local search)" : "your uploaded sources",
+            passages:
+              contextChunks.length > 0
+                ? contextChunks.map((c) => ({
+                    content: c.content,
+                    sourceName:
+                      sourceNames.get(c.sourceId) ?? "Uploaded source",
+                    page: c.page,
+                  }))
+                : undefined,
+          }
+        : undefined,
+    });
+
     const llmMessages: ChatMessage[] = [
       {
         role: "system",
-        content: buildSystemPrompt({
-          qualification: chat.qualification,
-          subject: chat.subject,
-          sourcesMode: groundedThisTurn,
-          context: groundedThisTurn
-            ? contextChunks.map((c) => ({
-                content: c.content,
-                sourceName: sourceNames.get(c.sourceId) ?? "Uploaded source",
-                page: c.page,
-              }))
-            : undefined,
-        }),
+        content:
+          groundedThisTurn && contextChunks.length > 0
+            ? `${systemPrompt}\n\n${STRICT_SOURCE_RULES}`
+            : systemPrompt,
       },
     ];
 
@@ -573,6 +551,15 @@ export const askTutor = action({
           console.warn(
             `[chats] Gemini fileSearch failed, falling back to gateway chain: ${msg}`,
           );
+          // Partial-stream guard: if the grounded call died mid-stream, some
+          // partial text may already be visible in the message bubble. Reset
+          // the buffer and overwrite the stored content from scratch so the
+          // fallback answer replaces (not concatenates onto) the partial one.
+          accumulated = "";
+          lastFlushed = 0;
+          await ctx.runMutation(internal.chatsInternal._resetMessageContent, {
+            messageId: msgId,
+          });
           const final = await streamChatCompletion(llmMessages, (delta) => {
             accumulated += delta;
             if (accumulated.length - lastFlushed >= 60) {

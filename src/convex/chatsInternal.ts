@@ -125,6 +125,18 @@ export const _updateMessageDelta = internalMutation({
   },
 });
 
+// Used when a grounded stream dies mid-answer and the fallback chain must
+// replace (not append to) the partially streamed text. Unconditional write.
+export const _resetMessageContent = internalMutation({
+  args: { messageId: v.id("messages") },
+  handler: async (ctx, args) => {
+    const msg = await ctx.db.get(args.messageId);
+    if (!msg) return;
+    if (msg.status === "complete" || msg.status === "error") return;
+    await ctx.db.patch(args.messageId, { content: "", status: "streaming" });
+  },
+});
+
 export const _finalizeMessage = internalMutation({
   args: {
     messageId: v.id("messages"),

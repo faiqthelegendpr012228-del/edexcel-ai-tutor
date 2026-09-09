@@ -14,8 +14,12 @@ import { GoogleGenAI } from "@google/genai";
  * 402 like OpenRouter), and auth problems with 400 API_KEY_INVALID / 403.
  */
 
-/** Tutor model: strong, fast, and fileSearch-tool capable. */
-export const GEMINI_TUTOR_MODEL = "gemini-2.5-flash";
+/**
+ * Tutor model: strong, fast, and fileSearch-tool capable. Kept on the
+ * current Flash generation (supersedes gemini-2.5-flash / gemini-2.0-flash);
+ * the official File Search docs use 3.x models with the fileSearch tool.
+ */
+export const GEMINI_TUTOR_MODEL = "gemini-3.8-flash";
 
 /** Lightweight tasks (flashcards, topic detection, marking). */
 export const GEMINI_QUICK_MODEL = "gemini-2.5-flash-lite";
