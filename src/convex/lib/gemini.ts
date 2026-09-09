@@ -227,7 +227,10 @@ export async function uploadToGeminiStore(
   });
   let op = operation;
   let waited = 0;
-  while (!op.done && waited < 120_000) {
+  // Big files (scanned textbooks) can take several minutes to index; a fixed
+  // 2-minute wait silently dropped them. Scale the patience to the upload.
+  const waitCap = opts.file.size > 25 * 1024 * 1024 ? 480_000 : 120_000;
+  while (!op.done && waited < waitCap) {
     await new Promise((r) => setTimeout(r, 2000));
     waited += 2000;
     op = await ai.operations.get({ operation: op });

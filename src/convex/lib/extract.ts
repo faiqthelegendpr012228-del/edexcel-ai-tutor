@@ -28,14 +28,16 @@ export class UnsupportedFormatError extends Error {
 
 export async function extractText(
   type: string,
-  bytes: ArrayBuffer,
+  // Accepted as Buffer/ArrayBuffer/Uint8Array so callers can hand over a
+  // zero-copy view of an already-in-memory buffer instead of forcing a copy.
+  bytes: Buffer | ArrayBuffer | Uint8Array,
   opts?: {
     pageConcurrency?: number;
     /** Called as pages complete so callers can persist live progress. */
     onProgress?: (donePages: number, totalPages: number) => void;
   },
 ): Promise<ExtractedDocument> {
-  const buffer = Buffer.from(bytes);
+  const buffer = toOwnedBuffer(bytes);
   switch (type) {
     case "pdf":
       return extractPdf(buffer, opts?.pageConcurrency ?? 6, opts?.onProgress);
@@ -63,27 +65,41 @@ async function extractPdf(
   onProgress?: (donePages: number, totalPages: number) => void,
 ): Promise<ExtractedDocument> {
   const pdfjs = await importPdfjs();
-  const doc = await pdfjs.getDocument({
-    data: new Uint8Array(buffer),
-  }).promise;
+  // Zero-copy view over the buffer (a plain `new Uint8Array(buffer)` on a
+  // Buffer would copy the whole file again).
+  const data = new Uint8Array(
+    buffer.buffer,
+    buffer.byteOffset,
+    buffer.byteLength,
+  );
+  const doc = await pdfjs.getDocument({ data }).promise;
   try {
     const total = doc.numPages;
     const pages: ExtractedPage[] = new Array(total);
 
     const extractPage = async (n: number) => {
       const page = await doc.getPage(n);
-      const content = await page.getTextContent();
-      let text = "";
-      const items = content.items as Array<{
-        str?: string;
-        hasEOL?: boolean;
-      }>;
-      for (const item of items) {
-        if (typeof item.str === "string") text += item.str;
-        if (item.hasEOL) text += "\n";
+      try {
+        const content = await page.getTextContent();
+        let text = "";
+        const items = content.items as Array<{
+          str?: string;
+          hasEOL?: boolean;
+        }>;
+        for (const item of items) {
+          if (typeof item.str === "string") text += item.str;
+          if (item.hasEOL) text += "\n";
+        }
+        text = text.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+        pages[n - 1] = { num: n, text };
+      } finally {
+        // Release this page's parsed content streams immediately. Without
+        // this, pdf.js keeps every page's operator list cached for the whole
+        // run and a 450-page book blows the 512MB Node action limit.
+        // (pdfjs 2.x returns void from cleanup(); newer lines a promise —
+        // Promise.resolve handles both.)
+        await Promise.resolve(page.cleanup()).catch(() => undefined);
       }
-      text = text.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
-      pages[n - 1] = { num: n, text };
     };
 
     // Text extraction is CPU-bound per page, so pages are processed in
@@ -119,6 +135,8 @@ interface PdfPage {
   getTextContent(): Promise<{
     items: Array<{ str?: string; hasEOL?: boolean }>;
   }>;
+  /** Frees the page's cached operator lists/content streams. */
+  cleanup(): void | Promise<void>;
 }
 
 interface PdfDocument {
@@ -240,6 +258,19 @@ function extractTagTexts(xml: string, tag: string): string[] {
     out.push(decodeXmlEntities(m[1]));
   }
   return out;
+}
+
+/**
+ * Normalize input bytes to a Buffer WITHOUT copying when possible: the hot
+ * path passes an already-owned Buffer from the streaming load; typed-array
+ * views wrap zero-copy; only a raw ArrayBuffer gets one (view) construction.
+ */
+function toOwnedBuffer(b: Buffer | ArrayBuffer | Uint8Array): Buffer {
+  if (Buffer.isBuffer(b)) return b;
+  if (b instanceof Uint8Array) {
+    return Buffer.from(b.buffer, b.byteOffset, b.byteLength);
+  }
+  return Buffer.from(b);
 }
 
 function decodeXmlEntities(s: string): string {

@@ -100,13 +100,23 @@ export const processSource = internalAction({
       const extracted = await (async () => {
         const file = await ctx.storage.get(args.storageId);
         if (file === null) return null;
-        const bytes = await file.arrayBuffer();
+        // Stream the blob into ONE owned buffer. `file.arrayBuffer()` would
+        // briefly hold two full copies (the Blob's internal + the returned
+        // buffer), and pdf.js's fake-worker loopback port clones the data
+        // AGAIN on the way in — three copies of a 150MB file overflow the
+        // hard 512MB Node action limit. This keeps the peak at two.
+        const buf = Buffer.allocUnsafe(file.size);
+        let offset = 0;
+        for await (const chunk of file.stream() as unknown as AsyncIterable<Uint8Array>) {
+          buf.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
         // Node actions get a hard 512MB. The raw bytes already sit in memory,
         // so parallel page parsing multiplies on top of that — big files get
         // a lower slice size to keep the pdf.js working set bounded.
         const pageConcurrency =
-          bytes.byteLength > 50 * 1024 * 1024 ? 3 : PDF_EXTRACT_CONCURRENCY;
-        return await extractText(args.type, bytes, {
+          file.size > 50 * 1024 * 1024 ? 3 : PDF_EXTRACT_CONCURRENCY;
+        return await extractText(args.type, buf, {
           pageConcurrency,
           onProgress: reportProgress,
         });
@@ -121,7 +131,7 @@ export const processSource = internalAction({
       const text = normalizeExtractedText(extracted.text);
       if (!text) {
         await fail(
-          "We couldn't find any readable text in this file. It may be a scanned document or contain only images.",
+          "This PDF has no selectable text — it's a scanned/image-only book (which is also why it's so large). Lumen can't index pages it can't read. Try a text-based copy of the book, or split it and check whether your copy of Pearson ActiveLearn provides the digital text version.",
         );
         return;
       }
