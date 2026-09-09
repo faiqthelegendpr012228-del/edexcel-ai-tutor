@@ -212,7 +212,7 @@ function SourceCard({
             <FolderOpen className="mr-1 size-3.5 text-muted-foreground" />
             <SelectValue />
           </SelectTrigger>
-          <SelectContent>
+          <SelectContent position="popper" align="start">
             <SelectItem value="none">No collection</SelectItem>
             {collections.map((c) => (
               <SelectItem key={c._id} value={c._id}>
@@ -269,8 +269,16 @@ export default function Sources() {
   }, [profile?.qualification]);
 
   useEffect(() => {
-    if (profile?.subject) setUploadSubject(profile.subject);
-  }, [profile?.subject]);
+    if (!profile) return;
+    // profile.subject stores a subject ID ("biology") but this dropdown's
+    // value domain is subject NAMES ("Biology") — the same domain chats and
+    // the backend's source-tag validation use. Resolve id → name; keep an
+    // already-valid name (older profiles); clear otherwise so the placeholder
+    // shows and uploads prompt for a real pick.
+    const byId = qualificationSubjects.find((s) => s.id === profile.subject);
+    const byName = qualificationSubjects.find((s) => s.name === profile.subject);
+    setUploadSubject(byId?.name ?? byName?.name ?? "");
+  }, [profile, qualificationSubjects]);
 
   const allSources = sources ?? [];
   const filtered = useMemo(
@@ -490,13 +498,25 @@ export default function Sources() {
                 }
               />
             </SelectTrigger>
-            <SelectContent>
-              {qualificationSubjects.map((s) => (
-                <SelectItem key={s.id} value={s.name}>
-                  {s.name}
+            { /* position="popper" is load-bearing: the default "item-aligned"
+               mode positions by aligning the selected item under the trigger
+               and silently renders nothing when the item list is empty (e.g.
+               profile still loading or an unmatched qualification id), which
+               looks exactly like "the dropdown doesn't open". */ }
+            <SelectContent position="popper" align="start" className="w-64">
+              {qualificationSubjects.length === 0 ? (
+                <SelectItem disabled value="__loading__">
+                  {profile === undefined
+                    ? "Loading subjects…"
+                    : "No subjects — finish onboarding first"}
                 </SelectItem>
-              ))
-              }
+              ) : (
+                qualificationSubjects.map((s) => (
+                  <SelectItem key={s.id} value={s.name}>
+                    {s.name}
+                  </SelectItem>
+                ))
+              )}
             </SelectContent>
           </Select>
           <p className="text-[11px] text-muted-foreground">
