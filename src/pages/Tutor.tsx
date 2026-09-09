@@ -3,6 +3,7 @@ import {
 } from "@/components/AppShell";
 import {
   CitationList,
+  GroundingBadge,
   Markdown,
   ModeBadge,
   TypingDots,
@@ -29,6 +30,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/convex/_generated/api";
 import type { Doc, Id } from "@/convex/_generated/dataModel";
 import { useAuth } from "@/hooks/use-auth";
+import { formatResetIn } from "@/lib/cooldown-format";
 import { cn } from "@/lib/utils";
 import { QUALIFICATIONS } from "@/lib/curriculum";
 import { useAction, useMutation, useQuery } from "convex/react";
@@ -332,10 +334,14 @@ function AssistantBubble({
   message,
   onAllowOutside,
   allowingOutside,
+  onReground,
+  regrounding,
 }: {
   message: Doc<"messages">;
   onAllowOutside: () => void;
   allowingOutside: boolean;
+  onReground: () => void;
+  regrounding: boolean;
 }) {
   const navigate = useNavigate();
   const generateCards = useAction(api.practice.generateFromMessage);
@@ -411,6 +417,12 @@ function AssistantBubble({
         <div className="mb-1 flex items-center gap-2">
           <span className="text-xs font-semibold text-foreground">Lumen</span>
           {message.status === "complete" && (
+            <GroundingBadge
+              grounded={message.grounded}
+              reason={message.groundingReason}
+            />
+          )}
+          {message.status === "complete" && (
             <ModeBadge mode={message.mode} />
           )}
         </div>
@@ -484,6 +496,25 @@ function AssistantBubble({
               {message.status === "error" && (
                 <p className="mt-2 text-xs text-destructive">{message.error}</p>
               )}
+              {message.status === "complete" &&
+                message.grounded === false &&
+                !message.needsPermission && (
+                  <div className="mt-3 flex flex-wrap items-center gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-3 py-2">
+                    <p className="min-w-0 flex-1 text-xs text-muted-foreground">
+                      This answer wasn't checked against your sources.
+                    </p>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 shrink-0 rounded-full px-2.5 text-xs"
+                      disabled={regrounding}
+                      onClick={onReground}
+                    >
+                      <BookOpenCheck className="size-3.5" />
+                      {regrounding ? "Checking sources…" : "Check my sources"}
+                    </Button>
+                  </div>
+                )}
             </>
           )}
         </div>
@@ -507,9 +538,13 @@ function ChatView({ chatId }: { chatId: Id<"chats"> }) {
   const updateChat = useMutation(api.chats.updateChat);
   const deleteChat = useMutation(api.chats.deleteChat);
 
+  // Grounded-answer quota (rolling weekly window) for the composer hint.
+  const quota = useQuery(api.usage.getMyQuota);
+
   const [draft, setDraft] = useState("");
   const [pending, setPending] = useState<string | null>(null);
   const [allowingOutside, setAllowingOutside] = useState(false);
+  const [regrounding, setRegrounding] = useState(false);
   const [atBottom, setAtBottom] = useState(true);
 
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -576,6 +611,24 @@ function ChatView({ chatId }: { chatId: Id<"chats"> }) {
     setDraft("");
     if (textareaRef.current) textareaRef.current.style.height = "auto";
     void send(text);
+  };
+
+  // "Check my sources": re-run the last question through retrieval so an
+  // ungrounded answer can be upgraded to a grounded one.
+  const handleReground = async () => {
+    if (regrounding) return;
+    const lastUser = [...messages].reverse().find((m) => m.role === "user");
+    if (!lastUser) return;
+    setRegrounding(true);
+    try {
+      await sendAction({ chatId, content: lastUser.content, reground: true });
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : "Couldn't check sources.",
+      );
+    } finally {
+      setRegrounding(false);
+    }
   };
 
   const handleDelete = async (id: Id<"chats">) => {
@@ -799,12 +852,14 @@ function ChatView({ chatId }: { chatId: Id<"chats"> }) {
                   key={m._id}
                   message={m}
                   allowingOutside={allowingOutside}
+                  regrounding={regrounding}
                   onAllowOutside={() =>
                     void send(
                       "Please answer my previous question using outside knowledge.",
                       true,
                     )
                   }
+                  onReground={() => void handleReground()}
                 />
               ),
             )}
@@ -870,6 +925,8 @@ function ChatView({ chatId }: { chatId: Id<"chats"> }) {
                 {sourceModeOn
                   ? "Sources only — answers are grounded in your uploads with citations."
                   : "General mode — switch on “Sources only” to ground answers in your uploads."}
+                {sourceModeOn && quota &&
+                  ` ${quota.limit - quota.used} of ${quota.limit} source-checked answers left this week${quota.used >= quota.limit ? ` — resets in ${formatResetIn(quota.resetsInMs)}` : ""}.`}
               </p>
             </form>
           </div>

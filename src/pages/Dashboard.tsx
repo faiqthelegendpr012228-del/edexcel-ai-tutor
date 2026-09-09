@@ -247,6 +247,9 @@ function DashboardContent() {
   const chats = useQuery(api.chats.listChats);
   const sources = useQuery(api.sources.listSources);
   const flashStats = useQuery(api.practice.getStats);
+  // Real usage data (grounded File Search queries this month) for the
+  // quota/usage card.
+  const monthlyUsage = useQuery(api.usage.getMyMonthlyUsage);
 
   const readySources = useMemo(
     () => (sources ?? []).filter((s) => s.status === "ready"),
@@ -342,6 +345,58 @@ function DashboardContent() {
           }
         />
       </div>
+
+      {/* Grounded-query usage this month — the real-usage data the weekly
+          quota will be revisited against. */}
+      {monthlyUsage && monthlyUsage.length > 0 && (
+        <div className="rounded-2xl border bg-card p-4 sm:p-5">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <p className="text-sm font-medium">
+                Source-checked answers this month
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {monthlyUsage[monthlyUsage.length - 1]?.groundedQueries ?? 0} so
+                far in {new Date().toLocaleDateString(undefined, { month: "long" })}
+              </p>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              className="gap-2"
+              onClick={() => navigate("/tutor")}
+            >
+              <MessagesSquare className="size-4" />
+              Ask Lumen
+            </Button>
+          </div>
+          <div className="mt-3 flex items-end gap-1.5">
+            {[...monthlyUsage]
+              .sort((a, b) => a.month.localeCompare(b.month))
+              .slice(-6)
+              .map((m) => {
+                const max = Math.max(
+                  ...monthlyUsage.map((x) => x.groundedQueries),
+                  1,
+                );
+                return (
+                  <div key={m.month} className="flex flex-1 flex-col items-center gap-1">
+                    <div
+                      className="w-full rounded-t bg-primary/70"
+                      style={{
+                        height: `${Math.max(4, (m.groundedQueries / max) * 48)}px`,
+                      }}
+                      title={`${m.month}: ${m.groundedQueries} grounded queries`}
+                    />
+                    <span className="text-[10px] text-muted-foreground">
+                      {m.month.slice(5)}
+                    </span>
+                  </div>
+                );
+              })}
+          </div>
+        </div>
+      )}
 
       {/* Spaced repetition nudge */}
       {(flashStats?.due ?? 0) > 0 && (

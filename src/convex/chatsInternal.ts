@@ -190,26 +190,21 @@ export const _recordAiUsage = internalMutation({
 });
 
 /**
- * Quota status for one student over the rolling window. Rows older than the
- * window are pruned opportunistically so the index stays small without a cron.
+ * Quota status for one student over the rolling window. Read-only — stale
+ * rows are pruned separately in _pruneStaleUsage (writes aren't allowed in
+ * queries).
  */
 export const _getQuotaStatus = internalQuery({
   args: { userId: v.id("users") },
   handler: async (ctx, args) => {
     const now = Date.now();
     const windowStart = now - QUOTA_WINDOW_MS;
-    const rows = await ctx.db
+    const inWindow = await ctx.db
       .query("aiUsage")
-      .withIndex("by_user_window", (q) =>
-        q.eq("userId", args.userId).gte("windowStart", windowStart),
+      .withIndex("by_user_used", (q) =>
+        q.eq("userId", args.userId).gte("usedAt", windowStart),
       )
       .collect();
-
-    const inWindow = rows.filter((r) => r.usedAt > windowStart);
-    // Opportunistic cleanup of stale rows.
-    for (const row of rows) {
-      if (row.usedAt <= windowStart) await ctx.db.delete(row._id);
-    }
 
     const used = inWindow.length;
     const oldest = inWindow.reduce<number | null>(
@@ -221,6 +216,23 @@ export const _getQuotaStatus = internalQuery({
         ? Math.max(0, oldest + QUOTA_WINDOW_MS - now)
         : 0;
     return { used, limit: TUTOR_GROUNDED_QUOTA_PER_WEEK, resetsInMs };
+  },
+});
+
+/** Remove aiUsage rows older than the window; called after each logged query. */
+export const _pruneStaleUsage = internalMutation({
+  args: { userId: v.id("users") },
+  handler: async (ctx, args) => {
+    const cutoff = Date.now() - QUOTA_WINDOW_MS;
+    const stale = await ctx.db
+      .query("aiUsage")
+      .withIndex("by_user_used", (q) =>
+        q.eq("userId", args.userId).lt("usedAt", cutoff),
+      )
+      .take(200);
+    for (const row of stale) {
+      await ctx.db.delete(row._id);
+    }
   },
 });
 

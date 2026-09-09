@@ -116,7 +116,7 @@ const schema = defineSchema(
       usedAt: v.number(),
       windowStart: v.number(),
       subject: v.optional(v.string()),
-    }).index("by_user_window", ["userId", "windowStart"]),
+    }).index("by_user_used", ["userId", "usedAt"]),
 
     // Monthly aggregate of grounded queries per student (plus one platform-
     // wide row with userId undefined). The real-usage data used to revisit

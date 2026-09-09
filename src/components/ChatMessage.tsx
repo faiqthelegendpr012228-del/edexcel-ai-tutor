@@ -5,7 +5,7 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
-import { BookOpen } from "lucide-react";
+import { BookOpen, CircleAlert, ShieldCheck } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -112,6 +112,50 @@ export function ModeBadge({ mode }: { mode?: "sources" | "outside" }) {
       className="border-border/70 text-[10px] font-medium uppercase tracking-wide text-muted-foreground"
     >
       {mode === "sources" ? "From your sources" : "Outside knowledge"}
+    </Badge>
+  );
+}
+
+const GROUNDING_REASON_LABELS: Record<string, string> = {
+  acknowledgment: "no search needed",
+  followup: "no search needed",
+  empty: "no search needed",
+  outside: "outside knowledge",
+  quota: "weekly quota reached",
+};
+
+/**
+ * Transparency indicator: was this answer checked against the student's
+ * sources (spending a File Search query) or answered without a search?
+ * Only renders once the grounding state is known (undefined = still deciding
+ * or legacy message).
+ */
+export function GroundingBadge({
+  grounded,
+  reason,
+}: {
+  grounded?: boolean;
+  reason?: string;
+}) {
+  if (grounded === undefined) return null;
+  const qualifier = reason ? GROUNDING_REASON_LABELS[reason] : undefined;
+  return (
+    <Badge
+      variant="outline"
+      className={cn(
+        "gap-1 border text-[10px] font-medium",
+        grounded
+          ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
+          : "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-400",
+      )}
+    >
+      {grounded ? (
+        <ShieldCheck className="size-3" />
+      ) : (
+        <CircleAlert className="size-3" />
+      )}
+      {grounded ? "Grounded in sources" : "Not grounded"}
+      {qualifier ? ` · ${qualifier}` : ""}
     </Badge>
   );
 }

@@ -286,10 +286,19 @@ export const askTutor = action({
     chatId: v.id("chats"),
     content: v.string(),
     allowOutside: v.optional(v.boolean()),
+    // Re-run the last user message through retrieval ("Check my sources").
+    // No new user bubble is inserted; the flagged assistant message is
+    // replaced by a fresh answer.
+    reground: v.optional(v.boolean()),
   },
   handler: async (
     ctx: ActionCtx,
-    args: { chatId: Id<"chats">; content: string; allowOutside?: boolean },
+    args: {
+      chatId: Id<"chats">;
+      content: string;
+      allowOutside?: boolean;
+      reground?: boolean;
+    },
   ): Promise<{
     needsPermission: boolean;
     messageId: Id<"messages">;
@@ -297,6 +306,7 @@ export const askTutor = action({
   }> => {
     const userId = await getAuthUserId(ctx);
     if (userId === null) throw new Error("Not authenticated");
+    const reground = !!args.reground;
     const content = args.content.trim();
     if (!content) throw new Error("Message is empty");
     if (content.length > 8000) throw new Error("Message is too long");
@@ -308,9 +318,9 @@ export const askTutor = action({
 
     const allowOutside = !!args.allowOutside;
 
-    // Insert the user message (skipped when this is the "allow outside
-    // knowledge" follow-up for a message we already stored).
-    if (!allowOutside) {
+    // Insert the user message (skipped for reground / allow-outside
+    // follow-ups, which reuse the last stored user message).
+    if (!allowOutside && !reground) {
       await ctx.runMutation(internal.chatsInternal._insertMessage, {
         userId,
         chatId: args.chatId,
@@ -342,11 +352,18 @@ export const askTutor = action({
       chatId: args.chatId,
     });
     const hasPriorAssistantTurn = priorMessages.some(
-      (m) => m.role === "assistant" && m.content.trim().length > 0,
+      (m) =>
+        m.role === "assistant" &&
+        m._id !== msgId &&
+        m.content.trim().length > 0,
     );
-    const gating = allowOutside
-      ? ({ ground: false, reason: "outside" } as const)
-      : decideGrounding({ userMessage: content, hasPriorAssistantTurn });
+    // Reground always forces retrieval — the student explicitly asked for a
+    // source-checked answer for the last turn.
+    const gating = reground
+      ? ({ ground: true, reason: "forced" } as const)
+      : allowOutside
+        ? ({ ground: false, reason: "outside" } as const)
+        : decideGrounding({ userMessage: content, hasPriorAssistantTurn });
 
     // Quota only gates turns that would otherwise be grounded. When it's out,
     // the student still gets an answer — ungrounded, clearly labelled.
@@ -448,17 +465,25 @@ export const askTutor = action({
       },
     ];
 
-    // Past messages (skip empty placeholders); cap for context length.
+    // Past messages (skip empty placeholders and the streaming placeholder
+    // itself); cap for context length. The just-asked question is added last
+    // when it isn't already in history (reground / allow-outside reuse the
+    // stored one).
     const past = history.filter(
       (m) => m._id !== msgId && m.content.trim().length > 0,
     );
+    const lastStoredUser = [...past]
+      .reverse()
+      .find((m) => m.role === "user");
+    const questionAlreadyStored =
+      lastStoredUser !== undefined && lastStoredUser.content === content;
     for (const m of past.slice(-10)) {
       llmMessages.push({
         role: m.role === "user" ? "user" : "assistant",
         content: m.content,
       });
     }
-    if (!allowOutside) {
+    if (!allowOutside && !questionAlreadyStored) {
       llmMessages.push({ role: "user", content });
     }
 
@@ -502,7 +527,11 @@ export const askTutor = action({
               text: m.content,
             });
           }
-          if (!allowOutside) contents.push({ role: "user", text: content });
+          // Skip re-adding the question when it's already the last stored
+          // user message (normal path / reground); otherwise it lands twice.
+          if (!allowOutside && !questionAlreadyStored) {
+            contents.push({ role: "user", text: content });
+          }
           const gem = await geminiFileSearchStream({
             contents,
             storeName,
@@ -525,10 +554,14 @@ export const askTutor = action({
             snippet: c.snippet,
           }));
           needsPermission = false;
-          // Log the grounded query: rolling-window quota + monthly usage.
+          // Log the grounded query: rolling-window quota + monthly usage,
+          // and prune rows that have fallen out of the window.
           await ctx.runMutation(internal.chatsInternal._recordAiUsage, {
             userId,
             subject: chat.subject,
+          });
+          await ctx.runMutation(internal.chatsInternal._pruneStaleUsage, {
+            userId,
           });
           await ctx.runMutation(internal.usage._recordMonthly, {
             userId,

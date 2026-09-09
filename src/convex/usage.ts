@@ -10,7 +10,12 @@ import { QUOTA_WINDOW_DAYS, TUTOR_GROUNDED_QUOTA_PER_WEEK } from "./lib/limits";
  */
 export const getMyQuota = query({
   args: {},
-  handler: async (ctx) => {
+  handler: async (ctx): Promise<{
+    used: number;
+    limit: number;
+    resetsInMs: number;
+    windowDays: number;
+  }> => {
     const userId = await getAuthUserId(ctx);
     if (userId === null) {
       return {
