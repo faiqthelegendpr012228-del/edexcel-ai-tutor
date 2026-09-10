@@ -15,14 +15,29 @@ import { GoogleGenAI } from "@google/genai";
  */
 
 /**
- * Tutor model: strong, fast, and fileSearch-tool capable. Kept on the
- * current Flash generation (supersedes gemini-2.5-flash / gemini-2.0-flash);
- * the official File Search docs use 3.x models with the fileSearch tool.
+ * Tutor model: verified against the live models list AND end-to-end with the
+ * fileSearch tool (grounded answer from the real store in ~5s).
+ * gemini-3.8-flash was dropped: during an availability incident it returned
+ * 503 "high demand" on plain calls and hung indefinitely over fileSearch
+ * streaming (no HTTP error at all) — see geminiFileSearchStream for the
+ * deadline guards that make this failure mode survivable.
  */
-export const GEMINI_TUTOR_MODEL = "gemini-3.8-flash";
+export const GEMINI_TUTOR_MODEL = "gemini-3.7-flash";
+
+/**
+ * Tutor fallbacks, tried in order when the primary model is unavailable.
+ * Both verified working with fileSearch against the same store.
+ */
+export const GEMINI_TUTOR_FALLBACK_MODELS = [
+  "gemini-3.5-flash",
+  "gemini-2.5-flash",
+] as const;
 
 /** Lightweight tasks (flashcards, topic detection, marking). */
 export const GEMINI_QUICK_MODEL = "gemini-2.5-flash-lite";
+
+/** Quick-task fallback when the lite model rate-limits or is unavailable. */
+export const GEMINI_QUICK_FALLBACK_MODELS = ["gemini-2.5-flash"] as const;
 
 /** Display name of the File Search Store used as the knowledge base. */
 export const GEMINI_STORE_DISPLAY_NAME = "edexcel-knowledge-base";
@@ -133,12 +148,51 @@ export function extractGroundingCitations(
     if (out.length >= 6) break;
   }
   return out;
-}
-
-/**
+}/**
  * Tutor answer with File Search grounding. Streams text deltas as they
  * arrive and returns the final content plus document citations.
+ *
+ * Resilience (shaped by a live incident where gemini-3.8-flash returned 503
+ * on plain calls and HUNG forever over fileSearch streaming — no HTTP error,
+ * no bytes, ever):
+ * - Primary model first, then a verified fallback chain.
+ * - Hard wall-clock deadlines: a stream that produces no text quickly fails
+ *   over to the next model; a stream that runs absurdly long is aborted.
+ * - If an attempt dies AFTER text reached the student, the partial answer is
+ *   returned as-is rather than retrying (a retry would duplicate or replace
+ *   text already on screen — same policy as lib/ai.ts).
  */
+const TUTOR_STREAM_FIRST_TEXT_TIMEOUT_MS = 45_000;
+const TUTOR_STREAM_TOTAL_TIMEOUT_MS = 120_000;
+
+function withDeadline<T>(
+  p: Promise<T>,
+  deadlineMs: number,
+  label: string,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () =>
+        reject(
+          new Error(
+            `${label} timed out after ${Math.round(deadlineMs / 1000)}s — no response`,
+          ),
+        ),
+      Math.max(deadlineMs, 1),
+    );
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e instanceof Error ? e : new Error(String(e)));
+      },
+    );
+  });
+}
+
 export async function geminiFileSearchStream(
   opts: {
     contents: Array<{ role: "user" | "model"; text: string }>;
@@ -151,49 +205,128 @@ export async function geminiFileSearchStream(
   },
 ): Promise<GeminiChatResult> {
   const ai = getGeminiClient();
-  const model = opts.model ?? GEMINI_TUTOR_MODEL;
+  const primary = opts.model ?? GEMINI_TUTOR_MODEL;
+  const chain = [
+    primary,
+    ...GEMINI_TUTOR_FALLBACK_MODELS.filter((m) => m !== primary),
+  ];
 
-  const response = await ai.models.generateContentStream({
-    model,
-    contents: opts.contents.map((c) => ({
-      role: c.role,
-      parts: [{ text: c.text }],
-    })),
-    config: {
-      systemInstruction: opts.systemPrompt ?? EDEXCEL_TUTOR_SYSTEM_PROMPT,
-      tools: [
-        {
-          fileSearch: {
-            fileSearchStoreNames: [opts.storeName],
-            ...(opts.metadataFilter
-              ? { metadataFilter: opts.metadataFilter }
-              : {}),
+  let lastError: Error | null = null;
+
+  for (const model of chain) {
+    // Only forward deltas while this attempt is live, so an abandoned
+    // hanging stream from a previous attempt can never interleave text
+    // with the next one.
+    let live = true;
+    let content = "";
+    let groundingMetadata: unknown;
+    const forwardDelta = (t: string) => {
+      if (!live) return;
+      content += t;
+      opts.onDelta(t);
+    };
+
+    const runAttempt = async (): Promise<GeminiChatResult> => {
+      const started = Date.now();
+      const response = await withDeadline(
+        ai.models.generateContentStream({
+          model,
+          contents: opts.contents.map((c) => ({
+            role: c.role,
+            parts: [{ text: c.text }],
+          })),
+          config: {
+            systemInstruction: opts.systemPrompt ?? EDEXCEL_TUTOR_SYSTEM_PROMPT,
+            tools: [
+              {
+                fileSearch: {
+                  fileSearchStoreNames: [opts.storeName],
+                  ...(opts.metadataFilter
+                    ? { metadataFilter: opts.metadataFilter }
+                    : {}),
+                },
+              },
+            ],
           },
-        },
-      ],
-    },
-  });
+        }),
+        TUTOR_STREAM_FIRST_TEXT_TIMEOUT_MS,
+        `Gemini ${model} (stream open)`,
+      );
 
-  let content = "";
-  let groundingMetadata: unknown;
-  for await (const chunk of response) {
-    const text = chunk.text;
-    if (text) {
-      content += text;
-      opts.onDelta(text);
-    }
-    if (chunk.candidates?.[0]?.groundingMetadata) {
-      groundingMetadata = chunk.candidates[0].groundingMetadata;
+      const iterator = (
+        response as AsyncIterable<{
+          text?: string;
+          candidates?: Array<{ groundingMetadata?: unknown }>;
+        }>
+      )[Symbol.asyncIterator]();
+      let firstTextSeen = false;
+      for (;;) {
+        const now = Date.now();
+        const totalLeft = started + TUTOR_STREAM_TOTAL_TIMEOUT_MS - now;
+        if (totalLeft <= 0) {
+          throw new Error(
+            `Gemini ${model} stream exceeded ${TUTOR_STREAM_TOTAL_TIMEOUT_MS / 1000}s — aborted`,
+          );
+        }
+        const firstLeft = started + TUTOR_STREAM_FIRST_TEXT_TIMEOUT_MS - now;
+        if (!firstTextSeen && firstLeft <= 0) {
+          throw new Error(
+            `Gemini ${model} produced no text within ${TUTOR_STREAM_FIRST_TEXT_TIMEOUT_MS / 1000}s (likely overloaded)`,
+          );
+        }
+        const chunk = await withDeadline(
+          iterator.next(),
+          firstTextSeen ? totalLeft : firstLeft,
+          `Gemini ${model} stream`,
+        );
+        if (chunk.done) break;
+        const text = chunk.value?.text;
+        if (text) {
+          firstTextSeen = true;
+          forwardDelta(text);
+        }
+        const gm = chunk.value?.candidates?.[0]?.groundingMetadata;
+        if (gm) groundingMetadata = gm;
+      }
+
+      if (!content.trim()) {
+        throw new Error("Gemini returned an empty response.");
+      }
+      return {
+        content,
+        citations: extractGroundingCitations(groundingMetadata),
+      };
+    };
+
+    try {
+      const result = await runAttempt();
+      live = false;
+      return result;
+    } catch (err) {
+      live = false;
+      let e = err instanceof Error ? err : new Error(String(err));
+      const status = (err as { status?: number }).status;
+      if (typeof status === "number") {
+        e = new Error(friendlyGeminiError(status, e.message));
+      }
+      lastError = e;
+      console.warn(
+        `[gemini] tutor fileSearch stream on ${model} failed: ${e.message}`,
+      );
+      if (content.trim().length > 0) {
+        // Partial answer already visible — return it rather than restarting
+        // with a different model and duplicating/replacing on-screen text.
+        return {
+          content,
+          citations: extractGroundingCitations(groundingMetadata),
+        };
+      }
     }
   }
 
-  if (!content.trim()) {
-    throw new Error("Gemini returned an empty response.");
-  }
-  return {
-    content,
-    citations: extractGroundingCitations(groundingMetadata),
-  };
+  throw (
+    lastError ?? new Error("Gemini File Search stream failed with no response.")
+  );
 }
 
 /**

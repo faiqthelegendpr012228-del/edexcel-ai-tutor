@@ -639,10 +639,14 @@ export const askTutor = action({
     } catch (err) {
       const message =
         err instanceof Error ? err.message : "The AI request failed.";
+      // The bubble shows a friendly apology PLUS the real underlying reason
+      // (rate limit, model overload, gateway auth failure…). Hiding the
+      // reason behind a generic message made failures impossible to
+      // diagnose from the UI — the error is also persisted on the row.
+      const reason = message.length > 280 ? `${message.slice(0, 280)}…` : message;
       await ctx.runMutation(internal.chatsInternal._finalizeMessage, {
         messageId: msgId,
-        content:
-          "Sorry — I hit a problem generating that answer. Please try again in a moment.",
+        content: `Sorry — I hit a problem generating that answer. Please try again in a moment.\n\n*Reason: ${reason}*`,
         error: message,
         mode,
       });

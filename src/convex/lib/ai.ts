@@ -2,6 +2,7 @@
 
 import { vly } from "../../lib/vly-integrations";
 import {
+  GEMINI_QUICK_FALLBACK_MODELS,
   GEMINI_QUICK_MODEL,
   geminiTextCompletion,
   hasGeminiKey,
@@ -305,21 +306,36 @@ export async function streamChatCompletion(
 
   // 2) The stream died before producing anything (gateway hiccup, model
   //    rejection, empty stream). Retry without streaming on the same model,
-  //    then on the reliable fallback model.
+  //    then on the reliable fallback model — with a hard deadline so a
+  //    wedged gateway call can't hang the student's answer forever.
+  const VLY_DEADLINE_MS = 45_000;
   const attempts: string[] = [model];
   if (MODELS.fallback !== model) attempts.push(MODELS.fallback);
 
   for (const attemptModel of attempts) {
     try {
-      const res = await vly.ai.completion(
-        {
-          model: attemptModel,
-          messages,
-          temperature: temperatureFor(attemptModel, opts?.temperature),
-          maxTokens: opts?.maxTokens ?? 4000,
-        },
-        { timeout: 120_000 },
-      );
+      const res = await Promise.race([
+        vly.ai.completion(
+          {
+            model: attemptModel,
+            messages,
+            temperature: temperatureFor(attemptModel, opts?.temperature),
+            maxTokens: opts?.maxTokens ?? 4000,
+          },
+          { timeout: 120_000 },
+        ),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () =>
+              reject(
+                new Error(
+                  `Gateway completion timed out after ${VLY_DEADLINE_MS / 1000}s`,
+                ),
+              ),
+            VLY_DEADLINE_MS,
+          ),
+        ),
+      ]);
       if (!res.success || !res.data) {
         throw new Error(res.error || "AI request failed");
       }
@@ -375,19 +391,26 @@ export async function chatCompletion(
   const model = opts?.model ?? MODELS.quick;
   const temperature = temperatureFor(model, opts?.temperature ?? 0.5);
 
-  // Gemini-first: when GEMINI_API_KEY is set, quick tasks run on Gemini's
-  // free-tier flash-lite model with the existing chain as fallback.
+  // Gemini-first: quick tasks run on Gemini's free-tier lite model, with a
+  // second Gemini model absorbing transient rate limits (429) and model
+  // unavailability (503) before anything touches the platform gateway —
+  // which has its own availability/auth problems and must be a last resort,
+  // not the first fallback.
   if (hasGeminiKey()) {
-    try {
-      const res = await geminiTextCompletion(messages, {
-        model: GEMINI_QUICK_MODEL,
-        temperature: opts?.temperature ?? 0.5,
-        maxTokens: opts?.maxTokens,
-      });
-      return res;
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.warn(`[ai] Gemini quick completion failed, using fallback: ${message}`);
+    const geminiModels = [GEMINI_QUICK_MODEL, ...GEMINI_QUICK_FALLBACK_MODELS];
+    for (const gModel of geminiModels) {
+      try {
+        return await geminiTextCompletion(messages, {
+          model: gModel,
+          temperature: opts?.temperature ?? 0.5,
+          maxTokens: opts?.maxTokens,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.warn(
+          `[ai] Gemini quick completion on ${gModel} failed: ${message}`,
+        );
+      }
     }
   }
 
