@@ -394,6 +394,154 @@ export async function deleteFromGeminiStore(docName: string): Promise<void> {
 }
 
 /**
+ * Streaming plain-text generation WITHOUT the fileSearch tool — used for
+ * tutor turns that don't need grounding (conversational replies, Source Mode
+ * off). Deliberately tool-free: fileSearch calls spend File Search quota,
+ * and the retrieval-gating design routes these turns away from it.
+ *
+ * Same resilience as geminiFileSearchStream: model fallback chain, hard
+ * deadlines, partial-answer preservation, live-gated delta forwarding.
+ */
+export async function geminiPlainStream(opts: {
+  messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
+  model?: string;
+  temperature?: number;
+  maxTokens?: number;
+  onDelta: (delta: string) => void;
+}): Promise<{
+  content: string;
+  promptTokens: number;
+  completionTokens: number;
+}> {
+  const ai = getGeminiClient();
+  const primary = opts.model ?? GEMINI_TUTOR_MODEL;
+  const chain = [
+    primary,
+    ...GEMINI_TUTOR_FALLBACK_MODELS.filter((m) => m !== primary),
+  ];
+
+  const system = opts.messages
+    .filter((m) => m.role === "system")
+    .map((m) => m.content)
+    .join("\n\n");
+  // Merge consecutive same-role messages (error retries can produce them);
+  // generateContent expects an alternating user/model conversation.
+  const turns: Array<{ role: "user" | "model"; text: string }> = [];
+  for (const m of opts.messages) {
+    if (m.role === "system") continue;
+    const role = m.role === "assistant" ? ("model" as const) : ("user" as const);
+    const prev = turns[turns.length - 1];
+    if (prev && prev.role === role) prev.text += `\n\n${m.content}`;
+    else turns.push({ role, text: m.content });
+  }
+
+  let lastError: Error | null = null;
+
+  for (const model of chain) {
+    let live = true;
+    let content = "";
+    const forwardDelta = (t: string) => {
+      if (!live) return;
+      content += t;
+      opts.onDelta(t);
+    };
+
+    const runAttempt = async () => {
+      const started = Date.now();
+      const response = await withDeadline(
+        ai.models.generateContentStream({
+          model,
+          contents: turns.map((t) => ({
+            role: t.role,
+            parts: [{ text: t.text }],
+          })),
+          config: {
+            ...(system ? { systemInstruction: system } : {}),
+            ...(opts.temperature !== undefined
+              ? { temperature: opts.temperature }
+              : {}),
+            ...(opts.maxTokens !== undefined
+              ? { maxOutputTokens: opts.maxTokens }
+              : {}),
+          },
+        }),
+        TUTOR_STREAM_FIRST_TEXT_TIMEOUT_MS,
+        `Gemini ${model} (stream open)`,
+      );
+
+      const iterator = (
+        response as AsyncIterable<{ text?: string; usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number } }>
+      )[Symbol.asyncIterator]();
+      let firstTextSeen = false;
+      let usage: { promptTokenCount?: number; candidatesTokenCount?: number } | undefined;
+      for (;;) {
+        const now = Date.now();
+        const totalLeft = started + TUTOR_STREAM_TOTAL_TIMEOUT_MS - now;
+        if (totalLeft <= 0) {
+          throw new Error(
+            `Gemini ${model} stream exceeded ${TUTOR_STREAM_TOTAL_TIMEOUT_MS / 1000}s — aborted`,
+          );
+        }
+        const firstLeft = started + TUTOR_STREAM_FIRST_TEXT_TIMEOUT_MS - now;
+        if (!firstTextSeen && firstLeft <= 0) {
+          throw new Error(
+            `Gemini ${model} produced no text within ${TUTOR_STREAM_FIRST_TEXT_TIMEOUT_MS / 1000}s (likely overloaded)`,
+          );
+        }
+        const chunk = await withDeadline(
+          iterator.next(),
+          firstTextSeen ? totalLeft : firstLeft,
+          `Gemini ${model} stream`,
+        );
+        if (chunk.done) break;
+        if (chunk.value?.usageMetadata) usage = chunk.value.usageMetadata;
+        const text = chunk.value?.text;
+        if (text) {
+          firstTextSeen = true;
+          forwardDelta(text);
+        }
+      }
+      if (!content.trim()) {
+        throw new Error("Gemini returned an empty response.");
+      }
+      return {
+        content,
+        promptTokens: usage?.promptTokenCount ?? 0,
+        completionTokens: usage?.candidatesTokenCount ?? 0,
+      };
+    };
+
+    try {
+      const result = await runAttempt();
+      live = false;
+      return result;
+    } catch (err) {
+      live = false;
+      let e = err instanceof Error ? err : new Error(String(err));
+      const status = (err as { status?: number }).status;
+      if (typeof status === "number") {
+        e = new Error(friendlyGeminiError(status, e.message));
+      }
+      lastError = e;
+      console.warn(`[gemini] plain stream on ${model} failed: ${e.message}`);
+      if (content.trim().length > 0) {
+        // Partial answer already visible — return it rather than restarting
+        // and duplicating on-screen text.
+        return {
+          content,
+          promptTokens: 0,
+          completionTokens: 0,
+        };
+      }
+    }
+  }
+
+  throw (
+    lastError ?? new Error("Gemini plain stream failed with no response.")
+  );
+}
+
+/**
  * Plain-text completion (no grounding) for lightweight structured tasks:
  * flashcards, topic detection, quiz marking, visualization HTML.
  */

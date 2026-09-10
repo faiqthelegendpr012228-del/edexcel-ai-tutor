@@ -4,6 +4,8 @@ import { vly } from "../../lib/vly-integrations";
 import {
   GEMINI_QUICK_FALLBACK_MODELS,
   GEMINI_QUICK_MODEL,
+  GEMINI_TUTOR_MODEL,
+  geminiPlainStream,
   geminiTextCompletion,
   hasGeminiKey,
 } from "./gemini";
@@ -295,13 +297,32 @@ export async function streamChatCompletion(
       completionTokens: res.data.usage?.completionTokens ?? 0,
     };
   } catch (err) {
-    lastError = err instanceof Error ? err.message : String(err);
+    lastError = `[gateway-stream:${model}] ${err instanceof Error ? err.message : String(err)}`;
   }
 
   // If some text already streamed to the student, don't retry — a fresh
   // answer would duplicate what is already on screen. Return what arrived.
   if (streamed.trim().length > 0) {
     return { content: streamed, promptTokens: 0, completionTokens: 0 };
+  }
+
+  // 1.5) Gemini direct: the primary AI provider for tutor-style turns, tried
+  // BEFORE any gateway retry. The platform gateway has been returning
+  // "Unauthorized" (verified by direct probe) — a failure here must never be
+  // the whole story while Gemini is available. Tool-free streaming → no
+  // File Search quota is spent on these turns.
+  if (hasGeminiKey()) {
+    try {
+      return await geminiPlainStream({
+        messages,
+        model: GEMINI_TUTOR_MODEL,
+        temperature,
+        maxTokens: opts?.maxTokens ?? 4000,
+        onDelta,
+      });
+    } catch (err) {
+      lastError = `[Gemini] ${err instanceof Error ? err.message : String(err)}`;
+    }
   }
 
   // 2) The stream died before producing anything (gateway hiccup, model
@@ -353,7 +374,7 @@ export async function streamChatCompletion(
         completionTokens: res.data.usage?.completionTokens ?? 0,
       };
     } catch (err) {
-      lastError = err instanceof Error ? err.message : String(err);
+      lastError = `[gateway:${attemptModel}] ${err instanceof Error ? err.message : String(err)}`;
     }
   }
 
@@ -376,7 +397,7 @@ export async function streamChatCompletion(
         }
         return res;
       } catch (err) {
-        lastError = err instanceof Error ? err.message : String(err);
+        lastError = `[direct:${attemptModel}] ${err instanceof Error ? err.message : String(err)}`;
       }
     }
   }
