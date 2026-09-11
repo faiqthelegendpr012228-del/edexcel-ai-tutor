@@ -195,6 +195,55 @@ export const probeRealGrounded = internalAction({
   },
 });
 
+// ── 8. Regression probe for the poison-history bug: a conversation ending
+// in TWO assistant (model) messages — the exact shape from the incident logs
+// that produced 400 "Requests ending with a model turn are not supported"
+// on every Gemini leg, then '[gateway:gpt-4o-mini] Unauthorized'.
+export const probeTrailingModelTurn = internalAction({
+  args: {},
+  handler: async (_ctx, _args): Promise<Record<string, unknown>> => {
+    void _ctx;
+    const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
+      {
+        role: "system",
+        content:
+          "You are an AI tutor for Edexcel exam board students. Reply in one short sentence.",
+      },
+      { role: "user", content: "Make me flashcards about osmosis." },
+      {
+        role: "assistant",
+        content:
+          "Here are five flashcards on osmosis: 1) Define osmosis — the diffusion of water from a dilute to a more concentrated solution through a partially permeable membrane. …",
+      },
+      {
+        role: "assistant",
+        content:
+          "Sorry — I hit a problem generating that answer. Please try again in a moment.\n\n*Reason: [gateway:gpt-4o-mini] Unauthorized*",
+      },
+    ];
+    const t0 = Date.now();
+    try {
+      const r = await geminiPlainStream({
+        messages,
+        temperature: 0.7,
+        maxTokens: 300,
+        onDelta: () => {},
+      });
+      return {
+        ms: Date.now() - t0,
+        ok: true,
+        head: r.content.slice(0, 80),
+      };
+    } catch (err) {
+      return {
+        ms: Date.now() - t0,
+        ok: false,
+        error: String(err instanceof Error ? err.message : err).slice(0, 250),
+      };
+    }
+  },
+});
+
 // ── 7. Replay the REAL non-grounded request: system + history + current msg,
 // exactly as streamChatCompletion passes them to geminiPlainStream.
 export const probeRealPlain = internalAction({

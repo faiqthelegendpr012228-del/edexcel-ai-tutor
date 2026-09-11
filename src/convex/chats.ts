@@ -457,11 +457,20 @@ export const askTutor = action({
     ];
 
     // Past messages (skip empty placeholders and the streaming placeholder
-    // itself); cap for context length. The just-asked question is added last
-    // when it isn't already in history (reground / allow-outside reuse the
-    // stored one).
+    // itself, and skip prior assistant turns that ended in ERROR — a stored
+    // failure bubble would otherwise be replayed as assistant context on
+    // every later turn. Verified from function logs: one real transient
+    // failure poisons the whole chat from then on, ending every subsequent
+    // Gemini request with a model turn (400 "Requests ending with a model
+    // turn are not supported") and pushing the request through to the
+    // gateway's "Unauthorized" error forever after. Cap for context length.
+    // The just-asked question is added last when it isn't already in history
+    // (reground / allow-outside reuse the stored one).
     const past = history.filter(
-      (m) => m._id !== msgId && m.content.trim().length > 0,
+      (m) =>
+        m._id !== msgId &&
+        m.content.trim().length > 0 &&
+        m.status !== "error",
     );
     const lastStoredUser = [...past]
       .reverse()

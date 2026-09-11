@@ -165,6 +165,14 @@ export function extractGroundingCitations(
 const TUTOR_STREAM_FIRST_TEXT_TIMEOUT_MS = 45_000;
 const TUTOR_STREAM_TOTAL_TIMEOUT_MS = 120_000;
 
+/**
+ * One-shot backoff when a leg hits the key's per-minute rate limit (429).
+ * The limit is per-KEY, not per-model — the other models in the chain share
+ * it — so the right move is to wait once and retry, not to burn through
+ * the rest of the chain against the same exhausted limit.
+ */
+const GEMINI_RATE_LIMIT_BACKOFF_MS = 30_000;
+
 function withDeadline<T>(
   p: Promise<T>,
   deadlineMs: number,
@@ -212,6 +220,21 @@ export async function geminiFileSearchStream(
   ];
 
   let lastError: Error | null = null;
+  let retried429 = false;
+
+  // Gemini rejects requests whose contents end with a model turn (400
+  // "Requests ending with a model turn are not supported"). A conversation
+  // history that ends in a stored assistant message (e.g. a failure bubble)
+  // must be trimmed before the model is asked to continue it — otherwise
+  // every model in the fallback chain fails on the same request shape and
+  // the request falls through to the gateway with a totally unrelated error.
+  const contents = [...opts.contents];
+  while (
+    contents.length > 0 &&
+    contents[contents.length - 1].role === "model"
+  ) {
+    contents.pop();
+  }
 
   for (const model of chain) {
     // Only forward deltas while this attempt is live, so an abandoned
@@ -231,7 +254,7 @@ export async function geminiFileSearchStream(
       const response = await withDeadline(
         ai.models.generateContentStream({
           model,
-          contents: opts.contents.map((c) => ({
+          contents: contents.map((c) => ({
             role: c.role,
             parts: [{ text: c.text }],
           })),
@@ -434,8 +457,18 @@ export async function geminiPlainStream(opts: {
     if (prev && prev.role === role) prev.text += `\n\n${m.content}`;
     else turns.push({ role, text: m.content });
   }
+  // Same guard as geminiFileSearchStream: trailing model turns make Gemini
+  // reject the whole request (400), so trim them before asking the model to
+  // continue the conversation.
+  while (
+    turns.length > 0 &&
+    turns[turns.length - 1].role === "model"
+  ) {
+    turns.pop();
+  }
 
   let lastError: Error | null = null;
+  let retried429 = false;
 
   for (const model of chain) {
     let live = true;
