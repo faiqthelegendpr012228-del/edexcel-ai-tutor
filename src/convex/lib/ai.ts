@@ -11,17 +11,22 @@ import {
 } from "./gemini";
 
 /**
- * Provider abstraction for the AI services the platform uses in v1.
+ * Provider routing (v2, Gemini-first):
  *
- * - Chat: routed through the Freebuff/VLY AI gateway (zero configuration,
- *   billed automatically). Model routing can be tuned per call.
- * - Fallback chat: when the gateway rejects a request, we retry directly
- *   against the key stored in OPENAI_API_KEY. That key may be a real OpenAI
- *   key (api.openai.com) OR an OpenRouter key (`sk-or-v1…`, openrouter.ai) —
- *   both speak the same chat-completions protocol, so both are supported and
- *   routed to the right host automatically. OpenRouter 402 (low credits) is
- *   handled by retrying with the token budget the account can actually
- *   afford.
+ * - Quick tasks (flashcards, quiz generation, topic detection,
+ *   visualizations) and tutor-style turns all try Gemini BEFORE the
+ *   platform gateway. Gemini legs rotate across fallback models to absorb
+ *   transient 429s/503s; File Search is only used for grounded tutor turns,
+ *   so quick tasks spend no retrieval quota.
+ * - The Freebuff/VLY AI gateway is a middle fallback (zero configuration,
+ *   billed automatically), tried after the Gemini legs. Every gateway leg's
+ *   error is labeled `[gateway:<model>]` so a final failure names the layer.
+ * - Last resorts: the student's own OPENAI_API_KEY (real OpenAI key or
+ *   OpenRouter `sk-or-…` key — both speak chat-completions; OpenRouter 402
+ *   low-credit responses are retried within the affordable budget), then
+ *   one final Gemini revival for streaming tutor turns / non-gateway
+ *   responses, since a gateway that hard-fails (e.g. "Unauthorized") makes
+ *   the earlier Gemini failures look worse than they were.
  * - Embeddings: Gemini `gemini-embedding-001` via the same GEMINI_API_KEY
  *   used for the tutor (one provider to manage). Embeddings are only used by
  *   the local-RAG fallback chain — the primary tutor path uses Gemini File
@@ -436,8 +441,12 @@ export async function chatCompletion(
   }
 
   let lastError = "AI request failed";
+  let gatewaySucceeded = false;
   // One retry covers transient gateway hiccups on the lightweight tasks
   // (flashcards, topic detection) without meaningfully slowing them down.
+  // Errors are labeled with the layer so a failed request's final error
+  // never reads as a bare provider message (e.g. "Unauthorized") — the
+  // student/developer can always tell which leg died last.
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const res = await vly.ai.completion(
@@ -451,13 +460,14 @@ export async function chatCompletion(
       if (content.trim().length === 0) {
         throw new Error("The model returned an empty response.");
       }
+      gatewaySucceeded = true;
       return {
         content,
         promptTokens: res.data.usage?.promptTokens ?? 0,
         completionTokens: res.data.usage?.completionTokens ?? 0,
       };
     } catch (err) {
-      lastError = err instanceof Error ? err.message : String(err);
+      lastError = `[gateway:${model}] ${err instanceof Error ? err.message : String(err)}`;
     }
   }
 
@@ -474,8 +484,29 @@ export async function chatCompletion(
           opts?.maxTokens ?? 200,
         );
       } catch (err) {
-        lastError = err instanceof Error ? err.message : String(err);
+        lastError = `[direct:${attemptModel}] ${err instanceof Error ? err.message : String(err)}`;
       }
+    }
+  }
+
+  // Revival: if a gateway leg actually answered, don't spend extra time —
+  // its result is already in hand. But if the gateway never produced a
+  // response (e.g. hard-failing "Unauthorized" as verified by probe), the
+  // earlier Gemini legs' failures were likely transient (429/503 rotation),
+  // so retry Gemini once more before giving up — same revival rung the
+  // tutor's streaming chain has. geminiPlainStream internally walks the
+  // tutor model chain, giving flashcards several Gemini attempts here.
+  if (!gatewaySucceeded && hasGeminiKey()) {
+    try {
+      return await geminiPlainStream({
+        messages,
+        model: GEMINI_TUTOR_MODEL,
+        temperature: opts?.temperature ?? 0.5,
+        maxTokens: opts?.maxTokens ?? 4000,
+        onDelta: () => {},
+      });
+    } catch (err) {
+      lastError = `[Gemini-retry] ${err instanceof Error ? err.message : String(err)}`;
     }
   }
 
